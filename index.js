@@ -131,6 +131,174 @@ async function run() {
         });
       }
     });
+
+    // add-Event
+    app.get("/api/events/organization/:organizationId", async (req, res) => {
+  try {
+    const events = await eventsCollection
+      .find({ organizationId: req.params.organizationId })
+      .sort({ _id: -1 })
+      .toArray();
+    res.json(events);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch events" });
+  }
+});
+
+// helper: validate ObjectId so bad ids return 400 instead of crashing
+const isValidId = (id) => ObjectId.isValid(id) && String(new ObjectId(id)) === id;
+
+// ---------- CREATE ----------
+app.post("/api/events", async (req, res) => {
+  try {
+    const {
+      title,
+      category,
+      location,
+      date,
+      ticketPrice,
+      seats,
+      banner,
+      organizerEmail,
+      organizationId,
+    } = req.body;
+
+    if (!title || !category || !location || !date || !banner || !organizationId) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    const result = await eventsCollection.insertOne({
+      title,
+      category,
+      location,
+      date,
+      ticketPrice: Number(ticketPrice),
+      seats: Number(seats),
+      banner,
+      organizerEmail,
+      organizationId,
+      status: "pending", // always forced by the server
+      createdAt: new Date(),
+    });
+
+    res.status(201).json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to create event" });
+  }
+});
+
+// ---------- UPDATE ----------
+app.patch("/api/events/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) {
+      return res.status(400).json({ message: "Invalid event id" });
+    }
+
+    const { title, category, location, date, ticketPrice, seats, banner } =
+      req.body;
+
+    const result = await eventsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          title,
+          category,
+          location,
+          date,
+          ticketPrice: Number(ticketPrice),
+          seats: Number(seats),
+          banner,
+          status: "pending", // edits go back for approval
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to update event" });
+  }
+});
+
+// ---------- DELETE ----------
+app.delete("/api/events/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidId(id)) {
+      return res.status(400).json({ message: "Invalid event id" });
+    }
+
+    const result = await eventsCollection.deleteOne({ _id: new ObjectId(id) });
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to delete event" });
+  }
+});
+
+// escape user input so it can't break the regex
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Only approved events are public.
+// While testing, you can temporarily set this to {} to see pending events.
+const PUBLIC_FILTER = { status: "approved" };
+
+// ---------- BROWSE (search + filter + pagination) ----------
+app.get("/api/events", async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 8, 1), 24);
+    const { search, category, location } = req.query;
+
+    const query = { ...PUBLIC_FILTER };
+    if (search?.trim()) {
+      query.title = { $regex: escapeRegex(search.trim()), $options: "i" };
+    }
+    if (category) query.category = category;
+    if (location) query.location = location;
+
+    const [events, total] = await Promise.all([
+      eventsCollection
+        .find(query)
+        .sort({ date: 1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .toArray(),
+      eventsCollection.countDocuments(query),
+    ]);
+
+    res.json({
+      events,
+      total,
+      page,
+      totalPages: Math.max(Math.ceil(total / limit), 1),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch events" });
+  }
+});
+
+// ---------- FILTER OPTIONS (for the dropdowns) ----------
+app.get("/api/events-filters", async (req, res) => {
+  try {
+    const [categories, locations] = await Promise.all([
+      eventsCollection.distinct("category", PUBLIC_FILTER),
+      eventsCollection.distinct("location", PUBLIC_FILTER),
+    ]);
+    res.json({ categories: categories.sort(), locations: locations.sort() });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch filters" });
+  }
+});
+
+
+
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
     console.log(
