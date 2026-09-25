@@ -35,7 +35,7 @@ async function run() {
     const bookingCollection = db.collection("bookings");
     const paymentsCollection = db.collection("payments");
 
-    // Getting Organization Info 
+    // Getting Organization Info
     app.get("/api/organization/:email", async (req, res) => {
       try {
         const { email } = req.params;
@@ -134,79 +134,49 @@ async function run() {
 
     // add-Event
     app.get("/api/events/organization/:organizationId", async (req, res) => {
-  try {
-    const events = await eventsCollection
-      .find({ organizationId: req.params.organizationId })
-      .sort({ _id: -1 })
-      .toArray();
-    res.json(events);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Failed to fetch events" });
-  }
-});
-
-// helper: validate ObjectId so bad ids return 400 instead of crashing
-const isValidId = (id) => ObjectId.isValid(id) && String(new ObjectId(id)) === id;
-
-
-
-
-// ---------- CREATE ----------
-app.post("/api/events", async (req, res) => {
-  try {
-    const {
-      title,
-      category,
-      location,
-      date,
-      ticketPrice,
-      seats,
-      banner,
-      organizerEmail,
-      organizationId,
-    } = req.body;
-
-    if (!title || !category || !location || !date || !banner || !organizationId) {
-      return res.status(400).json({ message: "Missing required fields" });
-    }
-
-    const result = await eventsCollection.insertOne({
-      title,
-      category,
-      location,
-      date,
-      ticketPrice: Number(ticketPrice),
-      seats: Number(seats),
-      banner,
-      organizerEmail,
-      organizationId,
-      status: "pending", // always forced by the server
-      createdAt: new Date(),
+      try {
+        const events = await eventsCollection
+          .find({ organizationId: req.params.organizationId })
+          .sort({ _id: -1 })
+          .toArray();
+        res.json(events);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Failed to fetch events" });
+      }
     });
 
-    res.status(201).json(result);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Failed to create event" });
-  }
-});
+    // helper: validate ObjectId so bad ids return 400 instead of crashing
+    const isValidId = (id) =>
+      ObjectId.isValid(id) && String(new ObjectId(id)) === id;
 
-// ---------- UPDATE ----------
-app.patch("/api/events/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!isValidId(id)) {
-      return res.status(400).json({ message: "Invalid event id" });
-    }
+    // ---------- CREATE ----------
+    app.post("/api/events", async (req, res) => {
+      try {
+        const {
+          title,
+          category,
+          location,
+          date,
+          ticketPrice,
+          seats,
+          banner,
+          organizerEmail,
+          organizationId,
+        } = req.body;
 
-    const { title, category, location, date, ticketPrice, seats, banner } =
-      req.body;
+        if (
+          !title ||
+          !category ||
+          !location ||
+          !date ||
+          !banner ||
+          !organizationId
+        ) {
+          return res.status(400).json({ message: "Missing required fields" });
+        }
 
-    const result = await eventsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      {
-        $set: {
+        const result = await eventsCollection.insertOne({
           title,
           category,
           location,
@@ -214,174 +184,531 @@ app.patch("/api/events/:id", async (req, res) => {
           ticketPrice: Number(ticketPrice),
           seats: Number(seats),
           banner,
-          status: "pending", // edits go back for approval
-          updatedAt: new Date(),
-        },
+          organizerEmail,
+          organizationId,
+          status: "pending", // always forced by the server
+          createdAt: new Date(),
+        });
+
+        res.status(201).json(result);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Failed to create event" });
       }
-    );
-
-    res.json(result);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Failed to update event" });
-  }
-});
-
-// ---------- DELETE ----------
-app.delete("/api/events/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!isValidId(id)) {
-      return res.status(400).json({ message: "Invalid event id" });
-    }
-
-    const result = await eventsCollection.deleteOne({ _id: new ObjectId(id) });
-    res.json(result);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Failed to delete event" });
-  }
-});
-
-// escape user input so it can't break the regex
-const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-// Only approved events are public.
-// While testing, you can temporarily set this to {} to see pending events.
-const PUBLIC_FILTER = { status: "approved" };
-
-// ==========================================
-// GET SINGLE EVENT
-// Only approved events are publicly visible
-// ==========================================
-
-app.get("/api/events/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!isValidId(id)) {
-      return res.status(400).json({
-        message: "Invalid event id",
-      });
-    }
-
-    const event = await eventsCollection.findOne({
-      _id: new ObjectId(id),
-      status: "approved",
     });
 
-    if (!event) {
-      return res.status(404).json({
-        message: "Event not found",
-      });
-    }
-
-    res.json(event);
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).json({
-      message: "Failed to fetch event",
-    });
-  }
-});
-
-// ---------- BROWSE (search + filter + pagination) ----------
-app.get("/api/events", async (req, res) => {
-  try {
-    const page = Math.max(parseInt(req.query.page) || 1, 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit) || 8, 1), 24);
-    const { search, category, location } = req.query;
-
-    const query = { ...PUBLIC_FILTER };
-    if (search?.trim()) {
-      query.title = { $regex: escapeRegex(search.trim()), $options: "i" };
-    }
-    if (category) query.category = category;
-    if (location) query.location = location;
-
-    const [events, total] = await Promise.all([
-      eventsCollection
-        .find(query)
-        .sort({ date: 1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .toArray(),
-      eventsCollection.countDocuments(query),
-    ]);
-
-    res.json({
-      events,
-      total,
-      page,
-      totalPages: Math.max(Math.ceil(total / limit), 1),
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Failed to fetch events" });
-  }
-});
-
-app.get("/api/events-filters", async (req, res) => {
-  try {
-    const approvedEvents = await eventsCollection
-      .find(
-        { status: "approved" },
-        {
-          projection: {
-            category: 1,
-            location: 1,
-          },
+    // ---------- UPDATE ----------
+    app.patch("/api/events/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!isValidId(id)) {
+          return res.status(400).json({ message: "Invalid event id" });
         }
-      )
-      .toArray();
 
-    const categories = [
-      ...new Set(
-        approvedEvents
-          .map((event) => event.category)
-          .filter(Boolean)
-      ),
-    ].sort();
+        const { title, category, location, date, ticketPrice, seats, banner } =
+          req.body;
 
-    const locations = [
-      ...new Set(
-        approvedEvents
-          .map((event) => event.location)
-          .filter(Boolean)
-      ),
-    ].sort();
+        const result = await eventsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              title,
+              category,
+              location,
+              date,
+              ticketPrice: Number(ticketPrice),
+              seats: Number(seats),
+              banner,
+              status: "pending", // edits go back for approval
+              updatedAt: new Date(),
+            },
+          },
+        );
 
-    res.status(200).json({
-      categories,
-      locations,
+        res.json(result);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Failed to update event" });
+      }
     });
-  } catch (error) {
-    console.error("EVENT FILTER ERROR:", error);
 
-    res.status(500).json({
-      message: "Failed to fetch filters",
-      error: error.message,
+    // ---------- DELETE ----------
+    app.delete("/api/events/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        if (!isValidId(id)) {
+          return res.status(400).json({ message: "Invalid event id" });
+        }
+
+        const result = await eventsCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+        res.json(result);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Failed to delete event" });
+      }
     });
-  }
-});
 
-// GET events by organizer email (Add this to your backend server file)
-app.get("/api/events/organizer/:email", async (req, res) => {
-  try {
-    const { email } = req.params;
-    const events = await eventsCollection
-      .find({ organizerEmail: email })
-      .sort({ createdAt: -1 })
-      .toArray();
+    // escape user input so it can't break the regex
+    const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-    return res.status(200).json({ success: true, data: events });
-  } catch (error) {
-    console.error("Fetch organizer events error:", error);
-    return res.status(500).json({ success: false, message: "Failed to fetch events" });
-  }
-});
+    // Only approved events are public.
+    // While testing, you can temporarily set this to {} to see pending events.
+    const PUBLIC_FILTER = { status: "approved" };
 
+    // ==========================================
+    // GET SINGLE EVENT
+    // Only approved events are publicly visible
+    // ==========================================
+
+    app.get("/api/events/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!isValidId(id)) {
+          return res.status(400).json({
+            message: "Invalid event id",
+          });
+        }
+
+        const event = await eventsCollection.findOne({
+          _id: new ObjectId(id),
+          status: "approved",
+        });
+
+        if (!event) {
+          return res.status(404).json({
+            message: "Event not found",
+          });
+        }
+
+        res.json(event);
+      } catch (err) {
+        console.error(err);
+
+        res.status(500).json({
+          message: "Failed to fetch event",
+        });
+      }
+    });
+
+    // ---------- BROWSE (search + filter + pagination) ----------
+    app.get("/api/events", async (req, res) => {
+      try {
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 8, 1), 24);
+        const { search, category, location } = req.query;
+
+        const query = { ...PUBLIC_FILTER };
+        if (search?.trim()) {
+          query.title = { $regex: escapeRegex(search.trim()), $options: "i" };
+        }
+        if (category) query.category = category;
+        if (location) query.location = location;
+
+        const [events, total] = await Promise.all([
+          eventsCollection
+            .find(query)
+            .sort({ date: 1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .toArray(),
+          eventsCollection.countDocuments(query),
+        ]);
+
+        res.json({
+          events,
+          total,
+          page,
+          totalPages: Math.max(Math.ceil(total / limit), 1),
+        });
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Failed to fetch events" });
+      }
+    });
+
+    app.get("/api/events-filters", async (req, res) => {
+      try {
+        const approvedEvents = await eventsCollection
+          .find(
+            { status: "approved" },
+            {
+              projection: {
+                category: 1,
+                location: 1,
+              },
+            },
+          )
+          .toArray();
+
+        const categories = [
+          ...new Set(
+            approvedEvents.map((event) => event.category).filter(Boolean),
+          ),
+        ].sort();
+
+        const locations = [
+          ...new Set(
+            approvedEvents.map((event) => event.location).filter(Boolean),
+          ),
+        ].sort();
+
+        res.status(200).json({
+          categories,
+          locations,
+        });
+      } catch (error) {
+        console.error("EVENT FILTER ERROR:", error);
+
+        res.status(500).json({
+          message: "Failed to fetch filters",
+          error: error.message,
+        });
+      }
+    });
+
+    // GET events by organizer email (Add this to your backend server file)
+    app.get("/api/events/organizer/:email", async (req, res) => {
+      try {
+        const { email } = req.params;
+        const events = await eventsCollection
+          .find({ organizerEmail: email })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        return res.status(200).json({ success: true, data: events });
+      } catch (error) {
+        console.error("Fetch organizer events error:", error);
+        return res
+          .status(500)
+          .json({ success: false, message: "Failed to fetch events" });
+      }
+    });
+
+    // ---------- ATTENDEE OVERVIEW (stats + upcoming tickets) ----------
+    app.get("/api/bookings/overview/:email", async (req, res) => {
+      try {
+        const email = decodeURIComponent(req.params.email).toLowerCase();
+
+        const bookings = await bookingCollection
+          .aggregate([
+            { $match: { attendeeEmail: email } },
+            {
+              $addFields: {
+                eventObjectId: {
+                  $cond: [
+                    { $eq: [{ $strLenCP: "$eventId" }, 24] },
+                    { $toObjectId: "$eventId" },
+                    null,
+                  ],
+                },
+              },
+            },
+            {
+              $lookup: {
+                from: "events",
+                localField: "eventObjectId",
+                foreignField: "_id",
+                as: "event",
+              },
+            },
+            { $unwind: { path: "$event", preserveNullAndEmptyArrays: true } },
+            { $sort: { createdAt: -1 } },
+          ])
+          .toArray();
+
+        const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+
+        const totalTickets = bookings.reduce(
+          (sum, b) => sum + (b.quantity || 0),
+          0,
+        );
+        const totalSpent = bookings.reduce(
+          (sum, b) => sum + (b.amount || 0),
+          0,
+        );
+
+        const upcoming = bookings
+          .filter((b) => b.event?.date && b.event.date >= today)
+          .sort((a, b) => a.event.date.localeCompare(b.event.date));
+
+        const recentTickets = upcoming.slice(0, 5).map((b) => ({
+          _id: b._id,
+          bookingId: b._id,
+          eventId: b.eventId,
+          eventTitle: b.event?.title || b.eventTitle,
+          date: b.event?.date || null,
+          location: b.event?.location || "Location TBA",
+          banner: b.event?.banner || "",
+          ticketPrice: b.event?.ticketPrice ?? b.amount,
+          quantity: b.quantity,
+          amount: b.amount,
+          status: b.paymentStatus,
+          transactionId: b.transactionId,
+        }));
+
+        res.json({
+          stats: {
+            totalTickets,
+            upcomingEvents: upcoming.length,
+            totalSpent,
+          },
+          recentTickets,
+        });
+      } catch (err) {
+        console.error("Attendee overview error:", err);
+        res.status(500).json({ message: "Failed to fetch attendee overview" });
+      }
+    });
+
+    // ==========================================
+    // BOOKING APIs
+    // ==========================================
+
+    // ---------- CREATE BOOKING ----------
+    app.post("/api/bookings", async (req, res) => {
+      try {
+        const {
+          eventId,
+          eventTitle,
+          attendeeEmail,
+          quantity,
+          amount,
+          paymentStatus,
+          transactionId,
+          bookingDate,
+        } = req.body;
+
+        // Basic Validation
+        if (!eventId || !eventTitle || !attendeeEmail) {
+          return res.status(400).json({
+            message:
+              "Missing required booking details (eventId, eventTitle, attendeeEmail)",
+          });
+        }
+
+        // Auto-generate transaction ID if client doesn't send one
+        const finalTxnId =
+          transactionId ||
+          `TXN-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+
+        // Validate event existence and decrement available seats
+        if (isValidId(eventId)) {
+          const event = await eventsCollection.findOne({
+            _id: new ObjectId(eventId),
+          });
+
+          if (!event) {
+            return res.status(404).json({ message: "Event not found" });
+          }
+
+          const requestedQuantity = Number(quantity) || 1;
+
+          if (event.seats < requestedQuantity) {
+            return res.status(400).json({
+              message: "Not enough seats available for this event",
+            });
+          }
+
+          // Decrement available seats in eventsCollection
+          await eventsCollection.updateOne(
+            { _id: new ObjectId(eventId) },
+            { $inc: { seats: -requestedQuantity } },
+          );
+        }
+
+        // Construct booking document
+        const newBooking = {
+          eventId,
+          eventTitle,
+          attendeeEmail: attendeeEmail.toLowerCase(),
+          quantity: Number(quantity) || 1,
+          amount: Number(amount) || 0,
+          paymentStatus: paymentStatus || "confirmed",
+          transactionId: finalTxnId,
+          bookingDate: bookingDate ? new Date(bookingDate) : new Date(),
+          createdAt: new Date(),
+        };
+
+        const result = await bookingCollection.insertOne(newBooking);
+
+        return res.status(201).json({
+          success: true,
+          acknowledged: result.acknowledged,
+          insertedId: result.insertedId,
+          booking: newBooking,
+        });
+      } catch (error) {
+        console.error("Create booking error:", error);
+        return res
+          .status(500)
+          .json({ success: false, message: "Failed to process booking" });
+      }
+    });
+
+    // ---------- GET BOOKINGS BY ATTENDEE EMAIL ----------
+    app.get("/api/bookings/user/:email", async (req, res) => {
+      try {
+        const email = decodeURIComponent(req.params.email).toLowerCase();
+
+        const userBookings = await bookingCollection
+          .find({ attendeeEmail: email })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        return res.status(200).json(userBookings);
+      } catch (error) {
+        console.error("Fetch user bookings error:", error);
+        return res.status(500).json({ message: "Failed to fetch bookings" });
+      }
+    });
+
+    // ---------- GET ALL BOOKINGS FOR AN ORGANIZER'S EVENTS ----------
+    app.get("/api/bookings/organizer/:email", async (req, res) => {
+      try {
+        const email = decodeURIComponent(req.params.email).toLowerCase();
+
+        const organizerEvents = await eventsCollection
+          .find({ organizerEmail: email }, { projection: { _id: 1 } })
+          .toArray();
+
+        const eventIds = organizerEvents.map((e) => e._id.toString());
+
+        if (eventIds.length === 0) {
+          return res.status(200).json([]);
+        }
+
+        const bookings = await bookingCollection
+          .find({ eventId: { $in: eventIds } })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        return res.status(200).json(bookings);
+      } catch (error) {
+        console.error("Fetch organizer bookings error:", error);
+        return res
+          .status(500)
+          .json({ message: "Failed to fetch organizer bookings" });
+      }
+    });
+
+    // ---------- UPDATE BOOKING QUANTITY ----------
+    app.patch("/api/bookings/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { newQuantity } = req.body;
+
+        if (!isValidId(id)) {
+          return res.status(400).json({ message: "Invalid booking ID" });
+        }
+
+        const qty = Number(newQuantity);
+        if (!qty || qty < 1) {
+          return res
+            .status(400)
+            .json({ message: "Quantity must be at least 1" });
+        }
+
+        const existingBooking = await bookingCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!existingBooking) {
+          return res.status(404).json({ message: "Booking not found" });
+        }
+
+        const diff = qty - existingBooking.quantity;
+
+        // Check available seats if increasing quantity
+        if (diff > 0 && isValidId(existingBooking.eventId)) {
+          const event = await eventsCollection.findOne({
+            _id: new ObjectId(existingBooking.eventId),
+          });
+
+          if (!event || event.seats < diff) {
+            return res.status(400).json({
+              message: `Not enough seats available. Only ${event?.seats || 0} left.`,
+            });
+          }
+
+          // Decrement event seats by difference
+          await eventsCollection.updateOne(
+            { _id: new ObjectId(existingBooking.eventId) },
+            { $inc: { seats: -diff } },
+          );
+        } else if (diff < 0 && isValidId(existingBooking.eventId)) {
+          // Restore event seats if reducing quantity
+          await eventsCollection.updateOne(
+            { _id: new ObjectId(existingBooking.eventId) },
+            { $inc: { seats: Math.abs(diff) } },
+          );
+        }
+
+        // Recalculate amount based on price per ticket
+        const unitPrice =
+          existingBooking.amount / (existingBooking.quantity || 1);
+        const updatedAmount = unitPrice * qty;
+
+        const result = await bookingCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              quantity: qty,
+              amount: updatedAmount,
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        return res.status(200).json({
+          success: true,
+          message: "Booking updated successfully",
+          result,
+        });
+      } catch (error) {
+        console.error("Update booking error:", error);
+        return res.status(500).json({ message: "Failed to update booking" });
+      }
+    });
+
+    // ---------- CANCEL BOOKING ----------
+    app.delete("/api/bookings/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!isValidId(id)) {
+          return res.status(400).json({ message: "Invalid booking ID" });
+        }
+
+        const booking = await bookingCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!booking) {
+          return res.status(404).json({ message: "Booking not found" });
+        }
+
+        // Restore seats back to the event
+        if (isValidId(booking.eventId)) {
+          await eventsCollection.updateOne(
+            { _id: new ObjectId(booking.eventId) },
+            { $inc: { seats: Number(booking.quantity) || 1 } },
+          );
+        }
+
+        // Delete booking from database
+        await bookingCollection.deleteOne({ _id: new ObjectId(id) });
+
+        return res
+          .status(200)
+          .json({ success: true, message: "Booking cancelled successfully" });
+      } catch (error) {
+        console.error("Cancel booking error:", error);
+        return res.status(500).json({ message: "Failed to cancel booking" });
+      }
+    });
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
