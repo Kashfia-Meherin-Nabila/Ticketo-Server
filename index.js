@@ -149,6 +149,9 @@ async function run() {
 // helper: validate ObjectId so bad ids return 400 instead of crashing
 const isValidId = (id) => ObjectId.isValid(id) && String(new ObjectId(id)) === id;
 
+
+
+
 // ---------- CREATE ----------
 app.post("/api/events", async (req, res) => {
   try {
@@ -247,6 +250,42 @@ const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // While testing, you can temporarily set this to {} to see pending events.
 const PUBLIC_FILTER = { status: "approved" };
 
+// ==========================================
+// GET SINGLE EVENT
+// Only approved events are publicly visible
+// ==========================================
+
+app.get("/api/events/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidId(id)) {
+      return res.status(400).json({
+        message: "Invalid event id",
+      });
+    }
+
+    const event = await eventsCollection.findOne({
+      _id: new ObjectId(id),
+      status: "approved",
+    });
+
+    if (!event) {
+      return res.status(404).json({
+        message: "Event not found",
+      });
+    }
+
+    res.json(event);
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({
+      message: "Failed to fetch event",
+    });
+  }
+});
+
 // ---------- BROWSE (search + filter + pagination) ----------
 app.get("/api/events", async (req, res) => {
   try {
@@ -283,17 +322,47 @@ app.get("/api/events", async (req, res) => {
   }
 });
 
-// ---------- FILTER OPTIONS (for the dropdowns) ----------
 app.get("/api/events-filters", async (req, res) => {
   try {
-    const [categories, locations] = await Promise.all([
-      eventsCollection.distinct("category", PUBLIC_FILTER),
-      eventsCollection.distinct("location", PUBLIC_FILTER),
-    ]);
-    res.json({ categories: categories.sort(), locations: locations.sort() });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Failed to fetch filters" });
+    const approvedEvents = await eventsCollection
+      .find(
+        { status: "approved" },
+        {
+          projection: {
+            category: 1,
+            location: 1,
+          },
+        }
+      )
+      .toArray();
+
+    const categories = [
+      ...new Set(
+        approvedEvents
+          .map((event) => event.category)
+          .filter(Boolean)
+      ),
+    ].sort();
+
+    const locations = [
+      ...new Set(
+        approvedEvents
+          .map((event) => event.location)
+          .filter(Boolean)
+      ),
+    ].sort();
+
+    res.status(200).json({
+      categories,
+      locations,
+    });
+  } catch (error) {
+    console.error("EVENT FILTER ERROR:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch filters",
+      error: error.message,
+    });
   }
 });
 
