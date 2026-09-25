@@ -463,6 +463,735 @@ async function run() {
       }
     });
 
+
+    // ==========================================
+// ADMIN DASHBOARD
+// ==========================================
+
+// ---------- ADMIN OVERVIEW STATS ----------
+
+app.get("/api/admin/stats", async (req, res) => {
+  try {
+    const [
+      totalUsers,
+      blockedUsers,
+      totalEvents,
+      pendingEvents,
+      approvedEvents,
+      rejectedEvents,
+      totalBookings,
+      revenueResult,
+    ] = await Promise.all([
+      userCollection.countDocuments({}),
+
+      userCollection.countDocuments({
+        isBlocked: true,
+      }),
+
+      eventsCollection.countDocuments({}),
+
+      eventsCollection.countDocuments({
+        status: "pending",
+      }),
+
+      eventsCollection.countDocuments({
+        status: "approved",
+      }),
+
+      eventsCollection.countDocuments({
+        status: "rejected",
+      }),
+
+      bookingCollection.countDocuments({}),
+
+      bookingCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              totalRevenue: {
+                $sum: {
+                  $convert: {
+                    input: "$amount",
+                    to: "double",
+                    onError: 0,
+                    onNull: 0,
+                  },
+                },
+              },
+            },
+          },
+        ])
+        .toArray(),
+    ]);
+
+    const totalRevenue = revenueResult[0]?.totalRevenue || 0;
+
+    res.json({
+      totalUsers,
+      blockedUsers,
+      activeUsers: totalUsers - blockedUsers,
+
+      totalEvents,
+      pendingEvents,
+      approvedEvents,
+      rejectedEvents,
+
+      totalBookings,
+      totalRevenue,
+    });
+  } catch (error) {
+    console.error("Admin stats error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch admin stats",
+    });
+  }
+});
+
+// ==========================================
+// ADMIN USERS
+// ==========================================
+
+app.get("/api/admin/users", async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit) || 10, 1),
+      50
+    );
+
+    const search = req.query.search?.trim() || "";
+    const status = req.query.status || "";
+
+    const query = {};
+
+    if (search) {
+      const escapedSearch = search.replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&"
+      );
+
+      query.$or = [
+        {
+          name: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+        {
+          email: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+      ];
+    }
+
+    if (status === "blocked") {
+      query.isBlocked = true;
+    }
+
+    if (status === "active") {
+      query.$or = [
+        ...(query.$or || []),
+        {
+          isBlocked: {
+            $ne: true,
+          },
+        },
+      ];
+    }
+
+    const [users, total] = await Promise.all([
+      userCollection
+        .find(query)
+        .project({
+          name: 1,
+          email: 1,
+          image: 1,
+          role: 1,
+          isBlocked: 1,
+          createdAt: 1,
+        })
+        .sort({
+          createdAt: -1,
+        })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .toArray(),
+
+      userCollection.countDocuments(query),
+    ]);
+
+    res.json({
+      users,
+      total,
+      page,
+      totalPages: Math.max(Math.ceil(total / limit), 1),
+    });
+  } catch (error) {
+    console.error("Admin users error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch users",
+    });
+  }
+});
+
+app.patch("/api/admin/users/:id/block", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidId(id)) {
+      return res.status(400).json({
+        message: "Invalid user id",
+      });
+    }
+
+    const result = await userCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+      },
+      {
+        $set: {
+          isBlocked: true,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "User blocked successfully",
+    });
+  } catch (error) {
+    console.error("Block user error:", error);
+
+    res.status(500).json({
+      message: "Failed to block user",
+    });
+  }
+});
+
+app.patch("/api/admin/users/:id/unblock", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidId(id)) {
+      return res.status(400).json({
+        message: "Invalid user id",
+      });
+    }
+
+    const result = await userCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+      },
+      {
+        $set: {
+          isBlocked: false,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "User unblocked successfully",
+    });
+  } catch (error) {
+    console.error("Unblock user error:", error);
+
+    res.status(500).json({
+      message: "Failed to unblock user",
+    });
+  }
+});
+
+// ==========================================
+// ADMIN EVENTS
+// ==========================================
+
+app.get("/api/admin/events", async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit) || 10, 1),
+      50
+    );
+
+    const search = req.query.search?.trim() || "";
+    const status = req.query.status || "";
+
+    const query = {};
+
+    if (search) {
+      const escapedSearch = search.replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&"
+      );
+
+      query.$or = [
+        {
+          title: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+        {
+          category: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+        {
+          location: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+        {
+          organizerEmail: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+      ];
+    }
+
+    if (status) {
+      query.status = status;
+    }
+
+    const [events, total] = await Promise.all([
+      eventsCollection
+        .find(query)
+        .sort({
+          createdAt: -1,
+        })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .toArray(),
+
+      eventsCollection.countDocuments(query),
+    ]);
+
+    res.json({
+      events,
+      total,
+      page,
+      totalPages: Math.max(Math.ceil(total / limit), 1),
+    });
+  } catch (error) {
+    console.error("Admin events error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch admin events",
+    });
+  }
+});
+
+app.patch("/api/admin/events/:id/approve", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidId(id)) {
+      return res.status(400).json({
+        message: "Invalid event id",
+      });
+    }
+
+    const result = await eventsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+      },
+      {
+        $set: {
+          status: "approved",
+          moderatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        message: "Event not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Event approved successfully",
+    });
+  } catch (error) {
+    console.error("Approve event error:", error);
+
+    res.status(500).json({
+      message: "Failed to approve event",
+    });
+  }
+});
+
+app.patch("/api/admin/events/:id/reject", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidId(id)) {
+      return res.status(400).json({
+        message: "Invalid event id",
+      });
+    }
+
+    const result = await eventsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+      },
+      {
+        $set: {
+          status: "rejected",
+          moderatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        message: "Event not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Event rejected successfully",
+    });
+  } catch (error) {
+    console.error("Reject event error:", error);
+
+    res.status(500).json({
+      message: "Failed to reject event",
+    });
+  }
+});
+
+app.delete("/api/admin/events/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!isValidId(id)) {
+      return res.status(400).json({
+        message: "Invalid event id",
+      });
+    }
+
+    const result = await eventsCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        message: "Event not found",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Event deleted successfully",
+    });
+  } catch (error) {
+    console.error("Admin delete event error:", error);
+
+    res.status(500).json({
+      message: "Failed to delete event",
+    });
+  }
+});
+
+// ==========================================
+// ADMIN TRANSACTIONS
+// ==========================================
+
+app.get("/api/admin/transactions", async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit) || 10, 1),
+      50
+    );
+
+    const search = req.query.search?.trim() || "";
+    const status = req.query.status || "";
+
+    const query = {};
+
+    if (search) {
+      const escapedSearch = search.replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&"
+      );
+
+      query.$or = [
+        {
+          transactionId: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+        {
+          attendeeEmail: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+        {
+          eventTitle: {
+            $regex: escapedSearch,
+            $options: "i",
+          },
+        },
+      ];
+    }
+
+    if (status) {
+      query.paymentStatus = status;
+    }
+
+    const [transactions, total, revenueResult] =
+      await Promise.all([
+        bookingCollection
+          .find(query)
+          .sort({
+            createdAt: -1,
+          })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+
+        bookingCollection.countDocuments(query),
+
+        bookingCollection
+          .aggregate([
+            {
+              $match: query,
+            },
+            {
+              $group: {
+                _id: null,
+                totalRevenue: {
+                  $sum: {
+                    $convert: {
+                      input: "$amount",
+                      to: "double",
+                      onError: 0,
+                      onNull: 0,
+                    },
+                  },
+                },
+              },
+            },
+          ])
+          .toArray(),
+      ]);
+
+    res.json({
+      transactions,
+      total,
+      page,
+      totalPages: Math.max(Math.ceil(total / limit), 1),
+      totalRevenue: revenueResult[0]?.totalRevenue || 0,
+    });
+  } catch (error) {
+    console.error("Admin transactions error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch transactions",
+    });
+  }
+});
+
+// ==========================================
+// ADMIN ANALYTICS
+// ==========================================
+
+app.get("/api/admin/analytics", async (req, res) => {
+  try {
+    const [
+      monthlyUsers,
+      monthlyBookings,
+      categoryStats,
+      eventStatusStats,
+      revenueStats,
+    ] = await Promise.all([
+      // Users by month
+      userCollection
+        .aggregate([
+          {
+            $match: {
+              createdAt: {
+                $exists: true,
+              },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: {
+                  format: "%Y-%m",
+                  date: "$createdAt",
+                },
+              },
+              users: {
+                $sum: 1,
+              },
+            },
+          },
+          {
+            $sort: {
+              _id: 1,
+            },
+          },
+        ])
+        .toArray(),
+
+      // Bookings by month
+      bookingCollection
+        .aggregate([
+          {
+            $match: {
+              createdAt: {
+                $exists: true,
+              },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: {
+                  format: "%Y-%m",
+                  date: "$createdAt",
+                },
+              },
+              bookings: {
+                $sum: 1,
+              },
+            },
+          },
+          {
+            $sort: {
+              _id: 1,
+            },
+          },
+        ])
+        .toArray(),
+
+      // Events by category
+      eventsCollection
+        .aggregate([
+          {
+            $group: {
+              _id: "$category",
+              count: {
+                $sum: 1,
+              },
+            },
+          },
+          {
+            $sort: {
+              count: -1,
+            },
+          },
+        ])
+        .toArray(),
+
+      // Event status
+      eventsCollection
+        .aggregate([
+          {
+            $group: {
+              _id: "$status",
+              count: {
+                $sum: 1,
+              },
+            },
+          },
+        ])
+        .toArray(),
+
+      // Revenue by month
+      bookingCollection
+        .aggregate([
+          {
+            $match: {
+              createdAt: {
+                $exists: true,
+              },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: {
+                  format: "%Y-%m",
+                  date: "$createdAt",
+                },
+              },
+              revenue: {
+                $sum: {
+                  $convert: {
+                    input: "$amount",
+                    to: "double",
+                    onError: 0,
+                    onNull: 0,
+                  },
+                },
+              },
+            },
+          },
+          {
+            $sort: {
+              _id: 1,
+            },
+          },
+        ])
+        .toArray(),
+    ]);
+
+    res.json({
+      monthlyUsers,
+      monthlyBookings,
+      categoryStats,
+      eventStatusStats,
+      revenueStats,
+    });
+  } catch (error) {
+    console.error("Admin analytics error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch analytics",
+    });
+  }
+});
+
+
+
+
+
+
     // ==========================================
     // BOOKING APIs
     // ==========================================
