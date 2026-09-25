@@ -366,6 +366,21 @@ app.get("/api/events-filters", async (req, res) => {
   }
 });
 
+// GET events by organizer email (Add this to your backend server file)
+app.get("/api/events/organizer/:email", async (req, res) => {
+  try {
+    const { email } = req.params;
+    const events = await eventsCollection
+      .find({ organizerEmail: email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({ success: true, data: events });
+  } catch (error) {
+    console.error("Fetch organizer events error:", error);
+    return res.status(500).json({ success: false, message: "Failed to fetch events" });
+  }
+});
 
 
     // Send a ping to confirm a successful connection
