@@ -34,6 +34,169 @@ async function run() {
     const eventsCollection = db.collection("events");
     const bookingCollection = db.collection("bookings");
     const paymentsCollection = db.collection("payments");
+    const plansCollection = db.collection("plans");
+
+
+
+
+    // ==========================================
+// ORGANIZER OVERVIEW
+// ==========================================
+
+app.get("/api/organizer/overview/:email", async (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email)
+      .toLowerCase()
+      .trim();
+
+    // -----------------------------------------
+    // FIND ORGANIZER
+    // -----------------------------------------
+
+    const organizer = await userCollection.findOne({
+      email,
+    });
+
+    if (!organizer) {
+      return res.status(404).json({
+        message: "Organizer not found",
+      });
+    }
+
+    if (organizer.role !== "organizer") {
+      return res.status(403).json({
+        message: "This account is not an organizer",
+      });
+    }
+
+    // -----------------------------------------
+    // GET PLAN
+    // -----------------------------------------
+
+    const planId = organizer.plan || "free";
+
+    const plan = await plansCollection.findOne({
+      planId,
+      active: true,
+    });
+
+    if (!plan) {
+      return res.status(500).json({
+        message: "Organizer plan not found",
+      });
+    }
+
+    // -----------------------------------------
+    // GET EVENTS
+    // -----------------------------------------
+
+    const organizerEvents = await eventsCollection
+      .find({
+        organizerEmail: email,
+      })
+      .toArray();
+
+    const totalEvents = organizerEvents.length;
+
+    // -----------------------------------------
+    // GET BOOKINGS
+    // -----------------------------------------
+
+    const eventIds = organizerEvents.map((event) =>
+      event._id.toString()
+    );
+
+    let bookings = [];
+
+    if (eventIds.length > 0) {
+      bookings = await bookingCollection
+        .find({
+          eventId: {
+            $in: eventIds,
+          },
+        })
+        .toArray();
+    }
+
+    // -----------------------------------------
+    // CALCULATE STATS
+    // -----------------------------------------
+
+    const totalSoldTickets = bookings.reduce(
+      (sum, booking) =>
+        sum + (Number(booking.quantity) || 0),
+      0
+    );
+
+    const totalAttendees = totalSoldTickets;
+
+    const totalRevenue = bookings.reduce(
+      (sum, booking) =>
+        sum + (Number(booking.amount) || 0),
+      0
+    );
+
+    // -----------------------------------------
+    // EVENT LIMIT
+    // -----------------------------------------
+
+    const remainingEvents = plan.unlimitedEvents
+      ? null
+      : Math.max(plan.maxEvents - totalEvents, 0);
+
+    const canCreateEvent =
+      plan.unlimitedEvents ||
+      totalEvents < plan.maxEvents;
+
+    // -----------------------------------------
+    // RESPONSE
+    // -----------------------------------------
+
+    res.status(200).json({
+      success: true,
+
+      user: {
+        name: organizer.name || "",
+        email: organizer.email,
+        role: organizer.role,
+        plan: plan.planId,
+      },
+
+      plan: {
+        planId: plan.planId,
+        name: plan.name,
+        price: plan.price,
+        currency: plan.currency,
+        billingPeriod: plan.billingPeriod,
+        maxEvents: plan.maxEvents,
+        unlimitedEvents: plan.unlimitedEvents,
+        features: plan.features,
+      },
+
+      stats: {
+        totalEvents,
+        totalSoldTickets,
+        totalAttendees,
+        totalRevenue,
+      },
+
+      eventLimit: {
+        used: totalEvents,
+        limit: plan.unlimitedEvents
+          ? null
+          : plan.maxEvents,
+        remaining: remainingEvents,
+        canCreate: canCreateEvent,
+      },
+    });
+  } catch (error) {
+    console.error("Organizer overview error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch organizer overview",
+    });
+  }
+});
 
     // Getting Organization Info
     app.get("/api/organization/:email", async (req, res) => {
@@ -150,52 +313,143 @@ async function run() {
     const isValidId = (id) =>
       ObjectId.isValid(id) && String(new ObjectId(id)) === id;
 
-    // ---------- CREATE ----------
-    app.post("/api/events", async (req, res) => {
-      try {
-        const {
-          title,
-          category,
-          location,
-          date,
-          ticketPrice,
-          seats,
-          banner,
-          organizerEmail,
-          organizationId,
-        } = req.body;
+   // ---------- CREATE EVENT ----------
+app.post("/api/events", async (req, res) => {
+  try {
+    const {
+      title,
+      category,
+      location,
+      date,
+      ticketPrice,
+      seats,
+      banner,
+      organizerEmail,
+      organizationId,
+    } = req.body;
 
-        if (
-          !title ||
-          !category ||
-          !location ||
-          !date ||
-          !banner ||
-          !organizationId
-        ) {
-          return res.status(400).json({ message: "Missing required fields" });
-        }
+    if (
+      !title ||
+      !category ||
+      !location ||
+      !date ||
+      !banner ||
+      !organizationId ||
+      !organizerEmail
+    ) {
+      return res.status(400).json({
+        message: "Missing required fields",
+      });
+    }
 
-        const result = await eventsCollection.insertOne({
-          title,
-          category,
-          location,
-          date,
-          ticketPrice: Number(ticketPrice),
-          seats: Number(seats),
-          banner,
-          organizerEmail,
-          organizationId,
-          status: "pending", // always forced by the server
-          createdAt: new Date(),
-        });
+    const normalizedEmail = organizerEmail.toLowerCase().trim();
 
-        res.status(201).json(result);
-      } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: "Failed to create event" });
-      }
+    // -----------------------------------------
+    // FIND ORGANIZER
+    // -----------------------------------------
+
+    const organizer = await userCollection.findOne({
+      email: normalizedEmail,
     });
+
+    if (!organizer) {
+      return res.status(404).json({
+        message: "Organizer account not found",
+      });
+    }
+
+    if (organizer.role !== "organizer") {
+      return res.status(403).json({
+        message: "Only organizers can create events",
+      });
+    }
+
+    // -----------------------------------------
+    // GET ORGANIZER PLAN
+    // -----------------------------------------
+
+    const currentPlanId = organizer.plan || "free";
+
+    const plan = await plansCollection.findOne({
+      planId: currentPlanId,
+      active: true,
+    });
+
+    if (!plan) {
+      return res.status(500).json({
+        message: "Organizer plan configuration not found",
+      });
+    }
+
+    // -----------------------------------------
+    // COUNT ORGANIZER EVENTS
+    // -----------------------------------------
+
+    const eventCount = await eventsCollection.countDocuments({
+      organizerEmail: normalizedEmail,
+    });
+
+    // -----------------------------------------
+    // CHECK PLAN LIMIT
+    // -----------------------------------------
+
+    if (
+      !plan.unlimitedEvents &&
+      eventCount >= plan.maxEvents
+    ) {
+      return res.status(403).json({
+        success: false,
+        code: "PLAN_LIMIT_REACHED",
+        message: `Your ${plan.name} plan allows up to ${plan.maxEvents} events. Please upgrade your plan to create more events.`,
+        plan: {
+          planId: plan.planId,
+          name: plan.name,
+          maxEvents: plan.maxEvents,
+          unlimitedEvents: plan.unlimitedEvents,
+        },
+        usage: {
+          used: eventCount,
+          limit: plan.maxEvents,
+          remaining: 0,
+        },
+      });
+    }
+
+    // -----------------------------------------
+    // CREATE EVENT
+    // -----------------------------------------
+
+    const result = await eventsCollection.insertOne({
+      title,
+      category,
+      location,
+      date,
+      ticketPrice: Number(ticketPrice) || 0,
+      seats: Number(seats) || 0,
+      banner,
+      organizerEmail: normalizedEmail,
+      organizationId,
+
+      status: "pending",
+
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Event created successfully",
+      insertedId: result.insertedId,
+    });
+  } catch (err) {
+    console.error("Create event error:", err);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to create event",
+    });
+  }
+});
 
     // ---------- UPDATE ----------
     app.patch("/api/events/:id", async (req, res) => {
@@ -1183,6 +1437,23 @@ app.get("/api/admin/analytics", async (req, res) => {
 
     res.status(500).json({
       message: "Failed to fetch analytics",
+    });
+  }
+});
+
+app.get("/api/plans", async (req, res) => {
+  try {
+    const plans = await plansCollection
+      .find({ active: true })
+      .sort({ price: 1 })
+      .toArray();
+
+    res.status(200).json(plans);
+  } catch (error) {
+    console.error("Get plans error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch plans",
     });
   }
 });
