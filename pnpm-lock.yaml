@@ -20,6 +20,9 @@ importers:
       mongodb:
         specifier: ^7.6.0
         version: 7.6.0
+      stripe:
+        specifier: ^22.6.2
+        version: 22.6.2
 
 packages:
 
@@ -328,6 +331,15 @@ packages:
   statuses@2.0.2:
     resolution: {integrity: sha512-DvEy55V3DB7uknRo+4iOGT5fP1slR8wQohVdknigZPMpMstaKJQWhwiYBACJE3Ul2pTnATihhBYnRhZQHGBiRw==}
     engines: {node: '>= 0.8'}
+
+  stripe@22.6.2:
+    resolution: {integrity: sha512-PwRE2scocvXqDKPiskMa5vRJEAEkq46W69XyUYmAwrNSLr675lQnfqLwnsndAWizwgihOWw/irLmoFRo3ez7ew==}
+    engines: {node: '>=18'}
+    peerDependencies:
+      '@types/node': '>=18'
+    peerDependenciesMeta:
+      '@types/node':
+        optional: true
 
   toidentifier@1.0.1:
     resolution: {integrity: sha512-o5sSPKEkg/DIQNmH43V0/uerLrpzVedkUh8tGNvaeXpfpuwjKenlSox/2O/BTlZUtEe+JG7s5YhEz608PlAHRA==}
@@ -684,6 +696,8 @@ snapshots:
       memory-pager: 1.5.0
 
   statuses@2.0.2: {}
+
+  stripe@22.6.2: {}
 
   toidentifier@1.0.1: {}
 

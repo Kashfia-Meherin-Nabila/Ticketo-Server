@@ -5,11 +5,20 @@ const express = require("express");
 require("dotenv").config();
 const app = express();
 const cors = require("cors");
+const Stripe = require("stripe");
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const port = process.env.PORT;
 const { MongoClient, ServerApiVersion } = require("mongodb");
 const { ObjectId } = require("mongodb");
 
 app.use(cors());
+app.use(
+  "/api/payments/webhook",
+  express.raw({
+    type: "application/json",
+  })
+);
 app.use(express.json());
 
 const uri = process.env.MONGODB_URI;
@@ -37,166 +46,587 @@ async function run() {
     const plansCollection = db.collection("plans");
 
 
+    // ==========================================
+// STRIPE PAYMENT WEBHOOK
+// ==========================================
+
+app.post("/api/payments/webhook", async (req, res) => {
+  const signature = req.headers["stripe-signature"];
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (error) {
+    console.error("Stripe webhook signature error:", error.message);
+
+    return res.status(400).send(
+      `Webhook Error: ${error.message}`
+    );
+  }
+
+  try {
+    // ==========================================
+    // CHECKOUT COMPLETED
+    // ==========================================
+
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+
+      const planId = session.metadata?.planId;
+      const customerEmail =
+        session.customer_details?.email ||
+        session.customer_email;
+
+      const customerId =
+        typeof session.customer === "string"
+          ? session.customer
+          : session.customer?.id || null;
+
+      const subscriptionId =
+        typeof session.subscription === "string"
+          ? session.subscription
+          : session.subscription?.id || null;
+
+      // ------------------------------------------
+      // Validate required information
+      // ------------------------------------------
+
+      if (!planId) {
+        console.error(
+          "Stripe checkout session has no planId metadata"
+        );
+
+        return res.json({
+          received: true,
+          message: "Missing planId metadata",
+        });
+      }
+
+      if (!customerEmail) {
+        console.error(
+          "Stripe checkout session has no customer email"
+        );
+
+        return res.json({
+          received: true,
+          message: "Missing customer email",
+        });
+      }
+
+      // ------------------------------------------
+      // Find purchased plan
+      // ------------------------------------------
+
+      const purchasedPlan =
+        await plansCollection.findOne({
+          planId,
+          active: true,
+        });
+
+      if (!purchasedPlan) {
+        console.error(
+          `Plan not found: ${planId}`
+        );
+
+        return res.json({
+          received: true,
+          message: "Plan not found",
+        });
+      }
+
+      // ------------------------------------------
+      // Prevent duplicate payment records
+      // ------------------------------------------
+
+      const existingPayment =
+        await paymentsCollection.findOne({
+          stripeSessionId: session.id,
+        });
+
+      if (existingPayment) {
+        console.log(
+          "Payment already processed:",
+          session.id
+        );
+
+        return res.json({
+          received: true,
+          message: "Payment already processed",
+        });
+      }
+
+      // ------------------------------------------
+      // Save payment information
+      // ------------------------------------------
+
+      const paymentData = {
+        stripeSessionId: session.id,
+
+        stripePaymentIntentId:
+          typeof session.payment_intent === "string"
+            ? session.payment_intent
+            : session.payment_intent?.id || null,
+
+        stripeCustomerId: customerId,
+
+        stripeSubscriptionId: subscriptionId,
+
+        organizerEmail:
+          customerEmail.toLowerCase(),
+
+        planId: purchasedPlan.planId,
+
+        planName: purchasedPlan.name,
+
+        amount:
+          session.amount_total
+            ? session.amount_total / 100
+            : purchasedPlan.price,
+
+        currency:
+          session.currency ||
+          purchasedPlan.currency ||
+          "usd",
+
+        paymentStatus: "completed",
+
+        paymentType: "subscription",
+
+        billingPeriod:
+          purchasedPlan.billingPeriod || "monthly",
+
+        maxEvents:
+          purchasedPlan.maxEvents,
+
+        unlimitedEvents:
+          purchasedPlan.unlimitedEvents,
+
+        createdAt: new Date(),
+
+        updatedAt: new Date(),
+      };
+
+      await paymentsCollection.insertOne(
+        paymentData
+      );
+
+      console.log(
+        "Payment saved successfully:",
+        session.id
+      );
+
+      // ------------------------------------------
+      // Update organizer organization
+      // ------------------------------------------
+
+      const organization =
+        await organizationCollection.findOne({
+          organizerEmail:
+            customerEmail.toLowerCase(),
+        });
+
+      if (!organization) {
+        console.error(
+          "Organization not found for:",
+          customerEmail
+        );
+
+        return res.json({
+          received: true,
+          paymentSaved: true,
+          organizationUpdated: false,
+        });
+      }
+
+   // ------------------------------------------
+// Update organization plan
+// ------------------------------------------
+
+// If the new plan is unlimited, unlimitedEvents wins outright.
+// Otherwise, add the purchased plan's event allowance on top of
+// whatever the organization currently has.
+const currentMaxEvents = organization.maxEvents || 0;
+
+const newMaxEvents = purchasedPlan.unlimitedEvents
+  ? currentMaxEvents // irrelevant once unlimited, but keep a sane value
+  : currentMaxEvents + purchasedPlan.maxEvents;
+
+const newUnlimitedEvents =
+  organization.unlimitedEvents || purchasedPlan.unlimitedEvents;
+
+await organizationCollection.updateOne(
+  {
+    _id: organization._id,
+  },
+  {
+    $set: {
+      planId: purchasedPlan.planId,
+      planName: purchasedPlan.name,
+      maxEvents: newMaxEvents,
+      unlimitedEvents: newUnlimitedEvents,
+      planStatus: "active",
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: subscriptionId,
+      updatedAt: new Date(),
+    },
+  }
+);
+
+console.log(
+  `Organization plan updated: ${purchasedPlan.name} (maxEvents ${currentMaxEvents} -> ${newMaxEvents})`
+);
+// ------------------------------------------
+// Update organizer's user record plan
+// ------------------------------------------
+
+await userCollection.updateOne(
+  {
+    email: customerEmail.toLowerCase(),
+  },
+  {
+    $set: {
+      plan: purchasedPlan.planId,
+      updatedAt: new Date(),
+    },
+  }
+);
+
+console.log(
+  `User plan updated: ${customerEmail} -> ${purchasedPlan.planId}`
+);
+    }
+
+    // ==========================================
+    // CHECKOUT EXPIRED
+    // ==========================================
+
+    if (
+      event.type === "checkout.session.expired"
+    ) {
+      const session = event.data.object;
+
+      await paymentsCollection.updateOne(
+        {
+          stripeSessionId: session.id,
+        },
+        {
+          $set: {
+            paymentStatus: "expired",
+            updatedAt: new Date(),
+          },
+        }
+      );
+    }
+
+    // ==========================================
+    // SUBSCRIPTION DELETED
+    // ==========================================
+
+    if (
+      event.type ===
+      "customer.subscription.deleted"
+    ) {
+      const subscription =
+        event.data.object;
+
+      await organizationCollection.updateOne(
+        {
+          stripeSubscriptionId:
+            subscription.id,
+        },
+        {
+          $set: {
+            planId: "free",
+            planName: "Free",
+            maxEvents: 3,
+            unlimitedEvents: false,
+            planStatus: "cancelled",
+            stripeSubscriptionId: null,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      await paymentsCollection.updateMany(
+        {
+          stripeSubscriptionId:
+            subscription.id,
+
+          paymentStatus: "completed",
+        },
+        {
+          $set: {
+            paymentStatus: "cancelled",
+            updatedAt: new Date(),
+          },
+        }
+      );
+    }
+
+    return res.json({
+      received: true,
+    });
+  } catch (error) {
+    console.error(
+      "Stripe webhook processing error:",
+      error
+    );
+
+    return res.status(500).json({
+      success: false,
+      message:
+        "Failed to process Stripe webhook",
+    });
+  }
+});
+
+
 
 
     // ==========================================
 // ORGANIZER OVERVIEW
 // ==========================================
 
-app.get("/api/organizer/overview/:email", async (req, res) => {
-  try {
-    const email = decodeURIComponent(req.params.email)
-      .toLowerCase()
-      .trim();
+app.get(
+  "/api/organizer/overview/:email",
+  async (req, res) => {
+    try {
+      const email = decodeURIComponent(
+        req.params.email
+      ).toLowerCase();
 
-    // -----------------------------------------
-    // FIND ORGANIZER
-    // -----------------------------------------
+      // ==========================================
+      // ORGANIZATION
+      // ==========================================
 
-    const organizer = await userCollection.findOne({
-      email,
-    });
+      const organization =
+        await organizationCollection.findOne({
+          organizerEmail: email,
+        });
 
-    if (!organizer) {
-      return res.status(404).json({
-        message: "Organizer not found",
+      if (!organization) {
+        return res.status(404).json({
+          success: false,
+          message: "Organization not found",
+        });
+      }
+
+      // ==========================================
+      // EVENTS
+      // ==========================================
+
+      const totalEvents =
+        await eventsCollection.countDocuments({
+          organizationId: String(organization._id),
+        });
+
+      // ==========================================
+      // BOOKINGS
+      // ==========================================
+
+      const bookingStats =
+        await bookingCollection
+          .aggregate([
+            {
+              $match: {
+                eventId: {
+                  $exists: true,
+                },
+              },
+            },
+
+            {
+              $lookup: {
+                from: "events",
+                let: {
+                  bookingEventId: "$eventId",
+                },
+                pipeline: [
+                  {
+                    $match: {
+                      $expr: {
+                        $or: [
+                          {
+                            $eq: [
+                              {
+                                $toString: "$_id",
+                              },
+                              "$$bookingEventId",
+                            ],
+                          },
+                          {
+                            $eq: [
+                              "$_id",
+                              "$$bookingEventId",
+                            ],
+                          },
+                        ],
+                      },
+                    },
+                  },
+                ],
+                as: "event",
+              },
+            },
+
+            {
+              $unwind: {
+                path: "$event",
+                preserveNullAndEmptyArrays: false,
+              },
+            },
+
+            {
+              $match: {
+                "event.organizationId":
+                  String(organization._id),
+              },
+            },
+
+            {
+              $group: {
+                _id: null,
+
+                totalAttendees: {
+                  $sum: {
+                    $ifNull: ["$quantity", 0],
+                  },
+                },
+
+                totalRevenue: {
+                  $sum: {
+                    $ifNull: ["$amount", 0],
+                  },
+                },
+
+                totalSoldTickets: {
+                  $sum: {
+                    $ifNull: ["$quantity", 0],
+                  },
+                },
+              },
+            },
+          ])
+          .toArray();
+
+      const stats = bookingStats[0] || {
+        totalAttendees: 0,
+        totalRevenue: 0,
+        totalSoldTickets: 0,
+      };
+
+      // ==========================================
+      // PLAN
+      // ==========================================
+
+      let plan = await plansCollection.findOne({
+        planId: organization.planId || "free",
+        active: true,
       });
-    }
 
-    if (organizer.role !== "organizer") {
-      return res.status(403).json({
-        message: "This account is not an organizer",
+      // Safety fallback
+      if (!plan) {
+        plan = await plansCollection.findOne({
+          planId: "free",
+          active: true,
+        });
+      }
+
+      const maxEvents =
+        organization.maxEvents ??
+        plan?.maxEvents ??
+        3;
+
+      const unlimitedEvents =
+        organization.unlimitedEvents ??
+        plan?.unlimitedEvents ??
+        false;
+
+      const eventsRemaining = unlimitedEvents
+        ? null
+        : Math.max(maxEvents - totalEvents, 0);
+
+      return res.status(200).json({
+        success: true,
+
+        organization: {
+          _id: organization._id,
+          organizationName:
+            organization.organizationName,
+          organizerEmail:
+            organization.organizerEmail,
+        },
+
+        plan: {
+          planId: organization.planId || "free",
+          planName:
+            organization.planName ||
+            plan?.name ||
+            "Free",
+
+          maxEvents,
+
+          unlimitedEvents,
+
+          planStatus:
+            organization.planStatus || "active",
+
+          price: plan?.price || 0,
+
+          currency:
+            plan?.currency || "USD",
+
+          billingPeriod:
+            plan?.billingPeriod || "monthly",
+        },
+
+        usage: {
+          totalEvents,
+
+          eventsRemaining,
+
+          usagePercentage: unlimitedEvents
+            ? 0
+            : Math.min(
+                Math.round(
+                  (totalEvents / maxEvents) * 100
+                ),
+                100
+              ),
+        },
+
+        stats: {
+          totalEvents,
+
+          totalAttendees:
+            stats.totalAttendees || 0,
+
+          totalRevenue:
+            stats.totalRevenue || 0,
+
+          totalSoldTickets:
+            stats.totalSoldTickets || 0,
+        },
       });
-    }
+    } catch (error) {
+      console.error(
+        "Organizer overview error:",
+        error
+      );
 
-    // -----------------------------------------
-    // GET PLAN
-    // -----------------------------------------
-
-    const planId = organizer.plan || "free";
-
-    const plan = await plansCollection.findOne({
-      planId,
-      active: true,
-    });
-
-    if (!plan) {
       return res.status(500).json({
-        message: "Organizer plan not found",
+        success: false,
+        message:
+          "Failed to load organizer overview",
       });
     }
-
-    // -----------------------------------------
-    // GET EVENTS
-    // -----------------------------------------
-
-    const organizerEvents = await eventsCollection
-      .find({
-        organizerEmail: email,
-      })
-      .toArray();
-
-    const totalEvents = organizerEvents.length;
-
-    // -----------------------------------------
-    // GET BOOKINGS
-    // -----------------------------------------
-
-    const eventIds = organizerEvents.map((event) =>
-      event._id.toString()
-    );
-
-    let bookings = [];
-
-    if (eventIds.length > 0) {
-      bookings = await bookingCollection
-        .find({
-          eventId: {
-            $in: eventIds,
-          },
-        })
-        .toArray();
-    }
-
-    // -----------------------------------------
-    // CALCULATE STATS
-    // -----------------------------------------
-
-    const totalSoldTickets = bookings.reduce(
-      (sum, booking) =>
-        sum + (Number(booking.quantity) || 0),
-      0
-    );
-
-    const totalAttendees = totalSoldTickets;
-
-    const totalRevenue = bookings.reduce(
-      (sum, booking) =>
-        sum + (Number(booking.amount) || 0),
-      0
-    );
-
-    // -----------------------------------------
-    // EVENT LIMIT
-    // -----------------------------------------
-
-    const remainingEvents = plan.unlimitedEvents
-      ? null
-      : Math.max(plan.maxEvents - totalEvents, 0);
-
-    const canCreateEvent =
-      plan.unlimitedEvents ||
-      totalEvents < plan.maxEvents;
-
-    // -----------------------------------------
-    // RESPONSE
-    // -----------------------------------------
-
-    res.status(200).json({
-      success: true,
-
-      user: {
-        name: organizer.name || "",
-        email: organizer.email,
-        role: organizer.role,
-        plan: plan.planId,
-      },
-
-      plan: {
-        planId: plan.planId,
-        name: plan.name,
-        price: plan.price,
-        currency: plan.currency,
-        billingPeriod: plan.billingPeriod,
-        maxEvents: plan.maxEvents,
-        unlimitedEvents: plan.unlimitedEvents,
-        features: plan.features,
-      },
-
-      stats: {
-        totalEvents,
-        totalSoldTickets,
-        totalAttendees,
-        totalRevenue,
-      },
-
-      eventLimit: {
-        used: totalEvents,
-        limit: plan.unlimitedEvents
-          ? null
-          : plan.maxEvents,
-        remaining: remainingEvents,
-        canCreate: canCreateEvent,
-      },
-    });
-  } catch (error) {
-    console.error("Organizer overview error:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch organizer overview",
-    });
   }
-});
+);
 
     // Getting Organization Info
     app.get("/api/organization/:email", async (req, res) => {
@@ -218,46 +648,92 @@ app.get("/api/organizer/overview/:email", async (req, res) => {
     });
 
     // Post Organization in DB
-    app.post("/api/organization", async (req, res) => {
-      try {
-        const { organizationName, logo, website, description, organizerEmail } =
-          req.body;
+   app.post("/api/organization", async (req, res) => {
+  try {
+    const {
+      organizationName,
+      logo,
+      website,
+      description,
+      organizerEmail,
+    } = req.body;
 
-        // Check existing organization
-        const existingOrganization = await organizationCollection.findOne({
-          organizerEmail,
-        });
+    if (!organizationName || !organizerEmail) {
+      return res.status(400).json({
+        message: "Organization name and organizer email are required",
+      });
+    }
 
-        if (existingOrganization) {
-          return res.status(409).json({
-            message: "Organization already exists",
-            organization: existingOrganization,
-          });
-        }
+    // Check existing organization
+    const existingOrganization =
+      await organizationCollection.findOne({
+        organizerEmail,
+      });
 
-        const addData = {
-          organizationName,
-          logo,
-          website,
-          description,
-          organizerEmail,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-          status: "active",
-        };
+    if (existingOrganization) {
+      return res.status(409).json({
+        message: "Organization already exists",
+        organization: existingOrganization,
+      });
+    }
 
-        const result = await organizationCollection.insertOne(addData);
-
-        return res.status(201).json(result);
-      } catch (error) {
-        console.error("Create organization error:", error);
-
-        return res.status(500).json({
-          message: "Failed to create organization",
-        });
-      }
+    // Get Free plan
+    const freePlan = await plansCollection.findOne({
+      planId: "free",
+      active: true,
     });
 
+    if (!freePlan) {
+      return res.status(500).json({
+        message: "Free plan is not configured",
+      });
+    }
+
+    const addData = {
+      organizationName,
+      logo,
+      website,
+      description,
+      organizerEmail,
+
+      // ==============================
+      // DEFAULT FREE PLAN
+      // ==============================
+      planId: freePlan.planId,
+      planName: freePlan.name,
+      maxEvents: freePlan.maxEvents,
+      unlimitedEvents: freePlan.unlimitedEvents,
+      planStatus: "active",
+
+      // Stripe
+      stripeCustomerId: null,
+      stripeSubscriptionId: null,
+      subscriptionCurrentPeriodEnd: null,
+
+      status: "active",
+
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result =
+      await organizationCollection.insertOne(addData);
+
+    return res.status(201).json({
+      ...result,
+      organization: {
+        ...addData,
+        _id: result.insertedId,
+      },
+    });
+  } catch (error) {
+    console.error("Create organization error:", error);
+
+    return res.status(500).json({
+      message: "Failed to create organization",
+    });
+  }
+});
     // Updated organization info
     app.patch("/api/organization/:id", async (req, res) => {
       try {
@@ -414,6 +890,54 @@ app.post("/api/events", async (req, res) => {
         },
       });
     }
+    // ==========================================
+// CHECK ORGANIZER PLAN LIMIT
+// ==========================================
+
+const organization =
+  await organizationCollection.findOne({
+    _id: new ObjectId(organizationId),
+  });
+
+if (!organization) {
+  return res.status(404).json({
+    success: false,
+    message: "Organization not found",
+  });
+}
+
+let maxEvents = organization.maxEvents || 3;
+
+let unlimitedEvents =
+  organization.unlimitedEvents || false;
+
+let currentPlan =
+  organization.planId || "free";
+
+// Count current events
+const currentEventCount =
+  await eventsCollection.countDocuments({
+    organizationId: String(organization._id),
+  });
+
+// Check limit
+if (
+  !unlimitedEvents &&
+  currentEventCount >= maxEvents
+) {
+  return res.status(403).json({
+    success: false,
+    code: "PLAN_LIMIT_REACHED",
+
+    message: `You have reached the ${maxEvents}-event limit on the ${organization.planName || currentPlan} plan.`,
+
+    planId: currentPlan,
+
+    maxEvents,
+
+    currentEvents: currentEventCount,
+  });
+}
 
     // -----------------------------------------
     // CREATE EVENT
@@ -717,7 +1241,24 @@ app.post("/api/events", async (req, res) => {
       }
     });
 
+// ---------- GET PAYMENTS BY ORGANIZER EMAIL ----------
+app.get("/api/payments/organizer/:email", async (req, res) => {
+  try {
+    const email = decodeURIComponent(req.params.email).toLowerCase();
 
+    const payments = await paymentsCollection
+      .find({ organizerEmail: email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({ success: true, data: payments });
+  } catch (error) {
+    console.error("Fetch organizer payments error:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch payments" });
+  }
+});
     // ==========================================
 // ADMIN DASHBOARD
 // ==========================================
