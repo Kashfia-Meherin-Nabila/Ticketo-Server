@@ -55,6 +55,10 @@ app.post("/api/payments/webhook", async (req, res) => {
 
   let event;
 
+  // ==========================================
+  // VERIFY STRIPE WEBHOOK
+  // ==========================================
+
   try {
     event = stripe.webhooks.constructEvent(
       req.body,
@@ -62,11 +66,14 @@ app.post("/api/payments/webhook", async (req, res) => {
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (error) {
-    console.error("Stripe webhook signature error:", error.message);
-
-    return res.status(400).send(
-      `Webhook Error: ${error.message}`
+    console.error(
+      "Stripe webhook signature error:",
+      error.message
     );
+
+    return res
+      .status(400)
+      .send(`Webhook Error: ${error.message}`);
   }
 
   try {
@@ -77,228 +84,555 @@ app.post("/api/payments/webhook", async (req, res) => {
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
 
-      const planId = session.metadata?.planId;
-      const customerEmail =
-        session.customer_details?.email ||
-        session.customer_email;
+      const paymentType =
+        session.metadata?.paymentType;
 
-      const customerId =
-        typeof session.customer === "string"
-          ? session.customer
-          : session.customer?.id || null;
-
-      const subscriptionId =
-        typeof session.subscription === "string"
-          ? session.subscription
-          : session.subscription?.id || null;
-
-      // ------------------------------------------
-      // Validate required information
-      // ------------------------------------------
-
-      if (!planId) {
-        console.error(
-          "Stripe checkout session has no planId metadata"
-        );
-
-        return res.json({
-          received: true,
-          message: "Missing planId metadata",
-        });
-      }
-
-      if (!customerEmail) {
-        console.error(
-          "Stripe checkout session has no customer email"
-        );
-
-        return res.json({
-          received: true,
-          message: "Missing customer email",
-        });
-      }
-
-      // ------------------------------------------
-      // Find purchased plan
-      // ------------------------------------------
-
-      const purchasedPlan =
-        await plansCollection.findOne({
-          planId,
-          active: true,
-        });
-
-      if (!purchasedPlan) {
-        console.error(
-          `Plan not found: ${planId}`
-        );
-
-        return res.json({
-          received: true,
-          message: "Plan not found",
-        });
-      }
-
-      // ------------------------------------------
-      // Prevent duplicate payment records
-      // ------------------------------------------
-
-      const existingPayment =
-        await paymentsCollection.findOne({
-          stripeSessionId: session.id,
-        });
-
-      if (existingPayment) {
-        console.log(
-          "Payment already processed:",
-          session.id
-        );
-
-        return res.json({
-          received: true,
-          message: "Payment already processed",
-        });
-      }
-
-      // ------------------------------------------
-      // Save payment information
-      // ------------------------------------------
-
-      const paymentData = {
-        stripeSessionId: session.id,
-
-        stripePaymentIntentId:
-          typeof session.payment_intent === "string"
-            ? session.payment_intent
-            : session.payment_intent?.id || null,
-
-        stripeCustomerId: customerId,
-
-        stripeSubscriptionId: subscriptionId,
-
-        organizerEmail:
-          customerEmail.toLowerCase(),
-
-        planId: purchasedPlan.planId,
-
-        planName: purchasedPlan.name,
-
-        amount:
-          session.amount_total
-            ? session.amount_total / 100
-            : purchasedPlan.price,
-
-        currency:
-          session.currency ||
-          purchasedPlan.currency ||
-          "usd",
-
-        paymentStatus: "completed",
-
-        paymentType: "subscription",
-
-        billingPeriod:
-          purchasedPlan.billingPeriod || "monthly",
-
-        maxEvents:
-          purchasedPlan.maxEvents,
-
-        unlimitedEvents:
-          purchasedPlan.unlimitedEvents,
-
-        createdAt: new Date(),
-
-        updatedAt: new Date(),
-      };
-
-      await paymentsCollection.insertOne(
-        paymentData
+      console.log(
+        `Stripe checkout completed: ${session.id}`
       );
 
       console.log(
-        "Payment saved successfully:",
-        session.id
+        `Payment type: ${paymentType}`
       );
 
-      // ------------------------------------------
-      // Update organizer organization
-      // ------------------------------------------
+      // ==================================================
+      // EVENT TICKET PAYMENT
+      // ==================================================
 
-      const organization =
-        await organizationCollection.findOne({
-          organizerEmail:
-            customerEmail.toLowerCase(),
+      if (paymentType === "event_ticket") {
+        const eventId =
+          session.metadata?.eventId;
+
+        const eventTitle =
+          session.metadata?.eventTitle;
+
+        const attendeeEmail =
+          session.metadata?.attendeeEmail ||
+          session.customer_details?.email ||
+          session.customer_email;
+
+        const quantity =
+          Number(session.metadata?.quantity) || 1;
+
+        const totalAmount =
+          Number(session.metadata?.totalAmount) ||
+          Number(session.amount_total || 0) / 100;
+
+        // ------------------------------------------
+        // Validate event booking metadata
+        // ------------------------------------------
+
+        if (
+          !eventId ||
+          !eventTitle ||
+          !attendeeEmail
+        ) {
+          console.error(
+            "Missing event booking metadata:",
+            session.id
+          );
+
+          return res.json({
+            received: true,
+            bookingCreated: false,
+            message:
+              "Missing event booking metadata",
+          });
+        }
+
+        if (!isValidId(eventId)) {
+          console.error(
+            "Invalid event ID:",
+            eventId
+          );
+
+          return res.json({
+            received: true,
+            bookingCreated: false,
+            message: "Invalid event ID",
+          });
+        }
+
+        // ------------------------------------------
+        // Prevent duplicate booking
+        // ------------------------------------------
+
+        const existingBooking =
+          await bookingCollection.findOne({
+            stripeSessionId: session.id,
+          });
+
+        if (existingBooking) {
+          console.log(
+            "Booking already processed:",
+            session.id
+          );
+
+          return res.json({
+            received: true,
+            bookingCreated: false,
+            message: "Booking already processed",
+          });
+        }
+
+        // ------------------------------------------
+        // Find event
+        // ------------------------------------------
+
+        const eventData =
+          await eventsCollection.findOne({
+            _id: new ObjectId(eventId),
+          });
+
+        if (!eventData) {
+          console.error(
+            "Event not found:",
+            eventId
+          );
+
+          return res.json({
+            received: true,
+            bookingCreated: false,
+            message: "Event not found",
+          });
+        }
+
+        // ------------------------------------------
+        // Check available seats
+        // ------------------------------------------
+
+        const availableSeats =
+          Number(eventData.seats) || 0;
+
+        if (
+          availableSeats < quantity
+        ) {
+          console.error(
+            `Not enough seats for event ${eventId}. Available: ${availableSeats}, Requested: ${quantity}`
+          );
+
+          return res.json({
+            received: true,
+            bookingCreated: false,
+            message: "Not enough seats available",
+          });
+        }
+
+        // ------------------------------------------
+        // Atomically decrease seats
+        // ------------------------------------------
+
+        const seatUpdate =
+          await eventsCollection.updateOne(
+            {
+              _id: new ObjectId(eventId),
+              seats: {
+                $gte: quantity,
+              },
+            },
+            {
+              $inc: {
+                seats: -quantity,
+              },
+            }
+          );
+
+        if (
+          seatUpdate.modifiedCount !== 1
+        ) {
+          console.error(
+            "Failed to reserve event seats:",
+            eventId
+          );
+
+          return res.json({
+            received: true,
+            bookingCreated: false,
+            message:
+              "Unable to reserve seats",
+          });
+        }
+
+        // ------------------------------------------
+        // Generate transaction ID on server
+        // ------------------------------------------
+
+        const transactionId =
+          `TXN-${Date.now()}-${Math.floor(
+            1000 + Math.random() * 9000
+          )}`;
+
+        // ------------------------------------------
+        // Get Stripe payment intent
+        // ------------------------------------------
+
+        const stripePaymentIntentId =
+          typeof session.payment_intent ===
+          "string"
+            ? session.payment_intent
+            : session.payment_intent?.id ||
+              null;
+
+        // ------------------------------------------
+        // Create booking
+        // ------------------------------------------
+
+        const bookingData = {
+          eventId: String(eventId),
+
+          eventTitle: String(
+            eventTitle
+          ),
+
+          attendeeEmail:
+            String(
+              attendeeEmail
+            ).toLowerCase(),
+
+          quantity,
+
+          amount: totalAmount,
+
+          paymentStatus: "paid",
+
+          transactionId,
+
+          stripeSessionId:
+            session.id,
+
+          stripePaymentIntentId,
+
+          bookingDate: new Date(),
+
+          createdAt: new Date(),
+        };
+
+        await bookingCollection.insertOne(
+          bookingData
+        );
+
+        console.log(
+          "Event ticket booking created successfully:",
+          {
+            stripeSessionId:
+              session.id,
+            eventId,
+            attendeeEmail,
+            quantity,
+            amount: totalAmount,
+            transactionId,
+          }
+        );
+
+        return res.json({
+          received: true,
+          bookingCreated: true,
+          message:
+            "Event ticket booking created successfully",
         });
+      }
 
-      if (!organization) {
-        console.error(
-          "Organization not found for:",
-          customerEmail
+      // ==================================================
+      // SUBSCRIPTION PAYMENT
+      // ==================================================
+
+      if (
+        paymentType === "subscription" ||
+        session.metadata?.planId
+      ) {
+        const planId =
+          session.metadata?.planId;
+
+        const customerEmail =
+          session.customer_details?.email ||
+          session.customer_email;
+
+        const customerId =
+          typeof session.customer ===
+          "string"
+            ? session.customer
+            : session.customer?.id ||
+              null;
+
+        const subscriptionId =
+          typeof session.subscription ===
+          "string"
+            ? session.subscription
+            : session.subscription?.id ||
+              null;
+
+        // ------------------------------------------
+        // Validate plan ID
+        // ------------------------------------------
+
+        if (!planId) {
+          console.error(
+            "Stripe checkout session has no planId metadata"
+          );
+
+          return res.json({
+            received: true,
+            message:
+              "Missing planId metadata",
+          });
+        }
+
+        // ------------------------------------------
+        // Validate customer email
+        // ------------------------------------------
+
+        if (!customerEmail) {
+          console.error(
+            "Stripe checkout session has no customer email"
+          );
+
+          return res.json({
+            received: true,
+            message:
+              "Missing customer email",
+          });
+        }
+
+        const normalizedEmail =
+          customerEmail.toLowerCase();
+
+        // ------------------------------------------
+        // Find purchased plan
+        // ------------------------------------------
+
+        const purchasedPlan =
+          await plansCollection.findOne({
+            planId,
+            active: true,
+          });
+
+        if (!purchasedPlan) {
+          console.error(
+            `Plan not found: ${planId}`
+          );
+
+          return res.json({
+            received: true,
+            message: "Plan not found",
+          });
+        }
+
+        // ------------------------------------------
+        // Prevent duplicate payment records
+        // ------------------------------------------
+
+        const existingPayment =
+          await paymentsCollection.findOne({
+            stripeSessionId:
+              session.id,
+          });
+
+        if (existingPayment) {
+          console.log(
+            "Payment already processed:",
+            session.id
+          );
+
+          return res.json({
+            received: true,
+            message:
+              "Payment already processed",
+          });
+        }
+
+        // ------------------------------------------
+        // Save payment information
+        // ------------------------------------------
+
+        const paymentData = {
+          stripeSessionId:
+            session.id,
+
+          stripePaymentIntentId:
+            typeof session.payment_intent ===
+            "string"
+              ? session.payment_intent
+              : session.payment_intent?.id ||
+                null,
+
+          stripeCustomerId:
+            customerId,
+
+          stripeSubscriptionId:
+            subscriptionId,
+
+          organizerEmail:
+            normalizedEmail,
+
+          planId:
+            purchasedPlan.planId,
+
+          planName:
+            purchasedPlan.name,
+
+          amount:
+            session.amount_total
+              ? session.amount_total / 100
+              : Number(
+                  purchasedPlan.price
+                ) || 0,
+
+          currency: "USD",
+
+          paymentStatus:
+            "completed",
+
+          paymentType:
+            "subscription",
+
+          billingPeriod:
+            purchasedPlan.billingPeriod ||
+            "monthly",
+
+          maxEvents:
+            purchasedPlan.maxEvents,
+
+          unlimitedEvents:
+            purchasedPlan.unlimitedEvents,
+
+          createdAt:
+            new Date(),
+
+          updatedAt:
+            new Date(),
+        };
+
+        await paymentsCollection.insertOne(
+          paymentData
+        );
+
+        console.log(
+          "Subscription payment saved successfully:",
+          session.id
+        );
+
+        // ------------------------------------------
+        // Find organizer organization
+        // ------------------------------------------
+
+        const organization =
+          await organizationCollection.findOne({
+            organizerEmail:
+              normalizedEmail,
+          });
+
+        if (!organization) {
+          console.error(
+            "Organization not found for:",
+            normalizedEmail
+          );
+
+          return res.json({
+            received: true,
+            paymentSaved: true,
+            organizationUpdated: false,
+          });
+        }
+
+        // ------------------------------------------
+        // Update organization plan
+        // ------------------------------------------
+
+        const currentMaxEvents =
+          organization.maxEvents || 0;
+
+        const newMaxEvents =
+          purchasedPlan.unlimitedEvents
+            ? currentMaxEvents
+            : currentMaxEvents +
+              purchasedPlan.maxEvents;
+
+        const newUnlimitedEvents =
+          organization.unlimitedEvents ||
+          purchasedPlan.unlimitedEvents;
+
+        await organizationCollection.updateOne(
+          {
+            _id: organization._id,
+          },
+          {
+            $set: {
+              planId:
+                purchasedPlan.planId,
+
+              planName:
+                purchasedPlan.name,
+
+              maxEvents:
+                newMaxEvents,
+
+              unlimitedEvents:
+                newUnlimitedEvents,
+
+              planStatus:
+                "active",
+
+              stripeCustomerId:
+                customerId,
+
+              stripeSubscriptionId:
+                subscriptionId,
+
+              updatedAt:
+                new Date(),
+            },
+          }
+        );
+
+        console.log(
+          `Organization plan updated: ${purchasedPlan.name} (maxEvents ${currentMaxEvents} -> ${newMaxEvents})`
+        );
+
+        // ------------------------------------------
+        // Update organizer user plan
+        // ------------------------------------------
+
+        await userCollection.updateOne(
+          {
+            email:
+              normalizedEmail,
+          },
+          {
+            $set: {
+              plan:
+                purchasedPlan.planId,
+
+              updatedAt:
+                new Date(),
+            },
+          }
+        );
+
+        console.log(
+          `User plan updated: ${normalizedEmail} -> ${purchasedPlan.planId}`
         );
 
         return res.json({
           received: true,
           paymentSaved: true,
-          organizationUpdated: false,
+          organizationUpdated: true,
         });
       }
 
-   // ------------------------------------------
-// Update organization plan
-// ------------------------------------------
+      // ==================================================
+      // UNKNOWN PAYMENT TYPE
+      // ==================================================
 
-// If the new plan is unlimited, unlimitedEvents wins outright.
-// Otherwise, add the purchased plan's event allowance on top of
-// whatever the organization currently has.
-const currentMaxEvents = organization.maxEvents || 0;
+      console.warn(
+        "Unknown Stripe payment type:",
+        paymentType
+      );
 
-const newMaxEvents = purchasedPlan.unlimitedEvents
-  ? currentMaxEvents // irrelevant once unlimited, but keep a sane value
-  : currentMaxEvents + purchasedPlan.maxEvents;
-
-const newUnlimitedEvents =
-  organization.unlimitedEvents || purchasedPlan.unlimitedEvents;
-
-await organizationCollection.updateOne(
-  {
-    _id: organization._id,
-  },
-  {
-    $set: {
-      planId: purchasedPlan.planId,
-      planName: purchasedPlan.name,
-      maxEvents: newMaxEvents,
-      unlimitedEvents: newUnlimitedEvents,
-      planStatus: "active",
-      stripeCustomerId: customerId,
-      stripeSubscriptionId: subscriptionId,
-      updatedAt: new Date(),
-    },
-  }
-);
-
-console.log(
-  `Organization plan updated: ${purchasedPlan.name} (maxEvents ${currentMaxEvents} -> ${newMaxEvents})`
-);
-// ------------------------------------------
-// Update organizer's user record plan
-// ------------------------------------------
-
-await userCollection.updateOne(
-  {
-    email: customerEmail.toLowerCase(),
-  },
-  {
-    $set: {
-      plan: purchasedPlan.planId,
-      updatedAt: new Date(),
-    },
-  }
-);
-
-console.log(
-  `User plan updated: ${customerEmail} -> ${purchasedPlan.planId}`
-);
+      return res.json({
+        received: true,
+        message:
+          "Unknown payment type",
+      });
     }
 
     // ==========================================
@@ -306,21 +640,36 @@ console.log(
     // ==========================================
 
     if (
-      event.type === "checkout.session.expired"
+      event.type ===
+      "checkout.session.expired"
     ) {
-      const session = event.data.object;
+      const session =
+        event.data.object;
 
       await paymentsCollection.updateOne(
         {
-          stripeSessionId: session.id,
+          stripeSessionId:
+            session.id,
         },
         {
           $set: {
-            paymentStatus: "expired",
-            updatedAt: new Date(),
+            paymentStatus:
+              "expired",
+
+            updatedAt:
+              new Date(),
           },
         }
       );
+
+      console.log(
+        "Stripe checkout session expired:",
+        session.id
+      );
+
+      return res.json({
+        received: true,
+      });
     }
 
     // ==========================================
@@ -334,6 +683,10 @@ console.log(
       const subscription =
         event.data.object;
 
+      // ------------------------------------------
+      // Reset organization to free plan
+      // ------------------------------------------
+
       await organizationCollection.updateOne(
         {
           stripeSubscriptionId:
@@ -342,31 +695,67 @@ console.log(
         {
           $set: {
             planId: "free",
+
             planName: "Free",
+
             maxEvents: 3,
-            unlimitedEvents: false,
-            planStatus: "cancelled",
-            stripeSubscriptionId: null,
-            updatedAt: new Date(),
+
+            unlimitedEvents:
+              false,
+
+            planStatus:
+              "cancelled",
+
+            stripeSubscriptionId:
+              null,
+
+            updatedAt:
+              new Date(),
           },
         }
       );
+
+      // ------------------------------------------
+      // Mark subscription payments cancelled
+      // ------------------------------------------
 
       await paymentsCollection.updateMany(
         {
           stripeSubscriptionId:
             subscription.id,
 
-          paymentStatus: "completed",
+          paymentStatus:
+            "completed",
         },
         {
           $set: {
-            paymentStatus: "cancelled",
-            updatedAt: new Date(),
+            paymentStatus:
+              "cancelled",
+
+            updatedAt:
+              new Date(),
           },
         }
       );
+
+      console.log(
+        "Subscription cancelled:",
+        subscription.id
+      );
+
+      return res.json({
+        received: true,
+      });
     }
+
+    // ==========================================
+    // OTHER STRIPE EVENTS
+    // ==========================================
+
+    console.log(
+      "Unhandled Stripe event:",
+      event.type
+    );
 
     return res.json({
       received: true,
@@ -384,7 +773,6 @@ console.log(
     });
   }
 });
-
 
 
 
@@ -2007,88 +2395,128 @@ app.get("/api/plans", async (req, res) => {
     // ==========================================
     // BOOKING APIs
     // ==========================================
+app.get("/api/payments/checkout-session/:sessionId", async (req, res) => {
+  try {
+    const { sessionId } = req.params;
 
-    // ---------- CREATE BOOKING ----------
-    app.post("/api/bookings", async (req, res) => {
-      try {
-        const {
-          eventId,
-          eventTitle,
-          attendeeEmail,
-          quantity,
-          amount,
-          paymentStatus,
-          transactionId,
-          bookingDate,
-        } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({
+        success: false,
+        message: "Stripe session ID is required.",
+      });
+    }
 
-        // Basic Validation
-        if (!eventId || !eventTitle || !attendeeEmail) {
-          return res.status(400).json({
-            message:
-              "Missing required booking details (eventId, eventTitle, attendeeEmail)",
-          });
-        }
-
-        // Auto-generate transaction ID if client doesn't send one
-        const finalTxnId =
-          transactionId ||
-          `TXN-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
-
-        // Validate event existence and decrement available seats
-        if (isValidId(eventId)) {
-          const event = await eventsCollection.findOne({
-            _id: new ObjectId(eventId),
-          });
-
-          if (!event) {
-            return res.status(404).json({ message: "Event not found" });
-          }
-
-          const requestedQuantity = Number(quantity) || 1;
-
-          if (event.seats < requestedQuantity) {
-            return res.status(400).json({
-              message: "Not enough seats available for this event",
-            });
-          }
-
-          // Decrement available seats in eventsCollection
-          await eventsCollection.updateOne(
-            { _id: new ObjectId(eventId) },
-            { $inc: { seats: -requestedQuantity } },
-          );
-        }
-
-        // Construct booking document
-        const newBooking = {
-          eventId,
-          eventTitle,
-          attendeeEmail: attendeeEmail.toLowerCase(),
-          quantity: Number(quantity) || 1,
-          amount: Number(amount) || 0,
-          paymentStatus: paymentStatus || "confirmed",
-          transactionId: finalTxnId,
-          bookingDate: bookingDate ? new Date(bookingDate) : new Date(),
-          createdAt: new Date(),
-        };
-
-        const result = await bookingCollection.insertOne(newBooking);
-
-        return res.status(201).json({
-          success: true,
-          acknowledged: result.acknowledged,
-          insertedId: result.insertedId,
-          booking: newBooking,
-        });
-      } catch (error) {
-        console.error("Create booking error:", error);
-        return res
-          .status(500)
-          .json({ success: false, message: "Failed to process booking" });
-      }
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["line_items", "payment_intent"],
     });
 
+    return res.status(200).json({
+      success: true,
+      session,
+    });
+  } catch (error) {
+    console.error("Get Stripe checkout session error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message:
+        error?.message || "Failed to retrieve Stripe checkout session.",
+    });
+  }
+});
+
+
+    // ---------- CREATE BOOKING ----------
+ app.post("/api/bookings", async (req, res) => {
+  try {
+    const {
+      eventId,
+      eventTitle,
+      attendeeEmail,
+      quantity,
+      amount,
+      paymentStatus,
+      transactionId,
+      bookingDate,
+    } = req.body;
+
+    if (!eventId || !eventTitle || !attendeeEmail) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Missing required booking details (eventId, eventTitle, attendeeEmail)",
+      });
+    }
+
+    const requestedQuantity = Number(quantity) || 1;
+    const bookingAmount = Number(amount) || 0;
+
+    const finalTxnId =
+      transactionId ||
+      `TXN-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    // Check event and available seats
+    if (isValidId(eventId)) {
+      const event = await eventsCollection.findOne({
+        _id: new ObjectId(eventId),
+      });
+
+      if (!event) {
+        return res.status(404).json({
+          success: false,
+          message: "Event not found",
+        });
+      }
+
+      if (event.seats < requestedQuantity) {
+        return res.status(400).json({
+          success: false,
+          message: "Not enough seats available for this event",
+        });
+      }
+
+      // Reduce available seats
+      await eventsCollection.updateOne(
+        { _id: new ObjectId(eventId) },
+        {
+          $inc: {
+            seats: -requestedQuantity,
+          },
+        },
+      );
+    }
+
+    const newBooking = {
+      eventId: String(eventId),
+      eventTitle: String(eventTitle),
+      attendeeEmail: attendeeEmail.toLowerCase(),
+      quantity: requestedQuantity,
+      amount: bookingAmount,
+      paymentStatus: paymentStatus || "paid",
+      transactionId: finalTxnId,
+      bookingDate: bookingDate
+        ? new Date(bookingDate)
+        : new Date(),
+      createdAt: new Date(),
+    };
+
+    const result = await bookingCollection.insertOne(newBooking);
+
+    return res.status(201).json({
+      success: true,
+      message: "Booking created successfully",
+      insertedId: result.insertedId,
+      booking: newBooking,
+    });
+  } catch (error) {
+    console.error("Create booking error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to create booking",
+    });
+  }
+});
     // ---------- GET BOOKINGS BY ATTENDEE EMAIL ----------
     app.get("/api/bookings/user/:email", async (req, res) => {
       try {
@@ -2250,6 +2678,91 @@ app.get("/api/plans", async (req, res) => {
         return res.status(500).json({ message: "Failed to cancel booking" });
       }
     });
+
+    // ---------- UPDATE USER PROFILE ----------
+app.patch("/api/users/profile", async (req, res) => {
+  try {
+    const { email, name, image } = req.body;
+
+    // Validate email
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "Email is required",
+      });
+    }
+
+    // Validate name
+    if (!name || !name.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Name is required",
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // Find user
+    const existingUser = await userCollection.findOne({
+      email: normalizedEmail,
+    });
+
+    if (!existingUser) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // Update ONLY name and image
+    const updateData = {
+      name: name.trim(),
+      image: image || "",
+      updatedAt: new Date(),
+    };
+
+    const result = await userCollection.updateOne(
+      {
+        email: normalizedEmail,
+      },
+      {
+        $set: updateData,
+      }
+    );
+
+    if (result.modifiedCount === 0) {
+      return res.status(200).json({
+        success: true,
+        message: "Profile information is already up to date",
+      });
+    }
+
+    // Get updated user
+    const updatedUser = await userCollection.findOne(
+      {
+        email: normalizedEmail,
+      },
+      {
+        projection: {
+          password: 0,
+        },
+      }
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Profile updated successfully",
+      user: updatedUser,
+    });
+  } catch (error) {
+    console.error("Update profile error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update profile",
+    });
+  }
+});
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
