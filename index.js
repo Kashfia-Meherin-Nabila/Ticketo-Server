@@ -13,12 +13,7 @@ const { MongoClient, ServerApiVersion } = require("mongodb");
 const { ObjectId } = require("mongodb");
 
 app.use(cors());
-app.use(
-  "/api/payments/webhook",
-  express.raw({
-    type: "application/json",
-  })
-);
+app.use("/api/payments/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 
 const uri = process.env.MONGODB_URI;
@@ -46,81 +41,150 @@ async function run() {
     const plansCollection = db.collection("plans");
 
 
-    // ==========================================
+    await bookingCollection.createIndex(
+  { stripeSessionId: 1 },
+  {
+    unique: true,
+    sparse: true,
+  }
+);
+
+
+// ============================================================
 // STRIPE PAYMENT WEBHOOK
-// ==========================================
+// ============================================================
 
 app.post("/api/payments/webhook", async (req, res) => {
   const signature = req.headers["stripe-signature"];
 
-  let event;
+  console.log("==============================================");
+  console.log("🔥 STRIPE WEBHOOK HIT");
+  console.log("Signature exists:", Boolean(signature));
+  console.log("==============================================");
 
-  // ==========================================
+  if (!signature) {
+    console.error("❌ Missing Stripe signature");
+
+    return res.status(400).json({
+      received: false,
+      message: "Missing Stripe signature",
+    });
+  }
+
+  let stripeEvent;
+
+  // ==========================================================
   // VERIFY STRIPE WEBHOOK
-  // ==========================================
+  // ==========================================================
 
   try {
-    event = stripe.webhooks.constructEvent(
+    stripeEvent = stripe.webhooks.constructEvent(
       req.body,
       signature,
       process.env.STRIPE_WEBHOOK_SECRET
     );
+
+    console.log("✅ STRIPE WEBHOOK VERIFIED");
+    console.log("Stripe event type:", stripeEvent.type);
+    console.log("Stripe event ID:", stripeEvent.id);
   } catch (error) {
     console.error(
-      "Stripe webhook signature error:",
+      "❌ Stripe webhook signature error:",
       error.message
     );
 
-    return res
-      .status(400)
-      .send(`Webhook Error: ${error.message}`);
+    return res.status(400).send(
+      `Webhook Error: ${error.message}`
+    );
   }
 
-  try {
-    // ==========================================
-    // CHECKOUT COMPLETED
-    // ==========================================
+  // ==========================================================
+  // CHECKOUT SESSION COMPLETED
+  // ==========================================================
 
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
+  if (stripeEvent.type === "checkout.session.completed") {
+    const session = stripeEvent.data.object;
 
-      const paymentType =
-        session.metadata?.paymentType;
+    console.log("==============================================");
+    console.log("💳 CHECKOUT SESSION COMPLETED");
+    console.log("Session ID:", session.id);
+    console.log("Payment status:", session.payment_status);
+    console.log("Amount total:", session.amount_total);
+    console.log("Currency:", session.currency);
+    console.log("Metadata:", session.metadata);
+    console.log("==============================================");
 
-      console.log(
-        `Stripe checkout completed: ${session.id}`
-      );
+    const paymentType = session.metadata?.paymentType;
 
-      console.log(
-        `Payment type: ${paymentType}`
-      );
+    console.log("Payment type:", paymentType);
 
-      // ==================================================
-      // EVENT TICKET PAYMENT
-      // ==================================================
+    // ========================================================
+    // EVENT TICKET PAYMENT
+    // ========================================================
 
-      if (paymentType === "event_ticket") {
-        const eventId =
-          session.metadata?.eventId;
+    if (paymentType === "event_ticket") {
+      try {
+        // ----------------------------------------------------
+        // 1. Check payment status
+        // ----------------------------------------------------
 
-        const eventTitle =
-          session.metadata?.eventTitle;
+        if (session.payment_status !== "paid") {
+          console.warn(
+            "⚠️ Checkout completed but payment is not marked as paid:",
+            session.id
+          );
+
+          return res.json({
+            received: true,
+            bookingCreated: false,
+            message: "Payment is not completed yet",
+          });
+        }
+
+        // ----------------------------------------------------
+        // 2. Get metadata
+        // ----------------------------------------------------
+
+        const eventId = session.metadata?.eventId;
+
+        const eventTitle = session.metadata?.eventTitle;
 
         const attendeeEmail =
           session.metadata?.attendeeEmail ||
           session.customer_details?.email ||
           session.customer_email;
 
-        const quantity =
-          Number(session.metadata?.quantity) || 1;
+        const quantity = Number(
+          session.metadata?.quantity
+        );
 
-        const totalAmount =
-          Number(session.metadata?.totalAmount) ||
-          Number(session.amount_total || 0) / 100;
+        const metadataTotalAmount = Number(
+          session.metadata?.totalAmount
+        );
 
-        // ------------------------------------------
-        // Validate event booking metadata
-        // ------------------------------------------
+        // ----------------------------------------------------
+        // 3. Validate quantity
+        // ----------------------------------------------------
+
+        if (
+          !Number.isInteger(quantity) ||
+          quantity < 1
+        ) {
+          console.error(
+            "❌ Invalid ticket quantity:",
+            quantity
+          );
+
+          return res.json({
+            received: true,
+            bookingCreated: false,
+            message: "Invalid ticket quantity",
+          });
+        }
+
+        // ----------------------------------------------------
+        // 4. Validate required metadata
+        // ----------------------------------------------------
 
         if (
           !eventId ||
@@ -128,21 +192,29 @@ app.post("/api/payments/webhook", async (req, res) => {
           !attendeeEmail
         ) {
           console.error(
-            "Missing event booking metadata:",
-            session.id
+            "❌ Missing event booking metadata",
+            {
+              sessionId: session.id,
+              eventId,
+              eventTitle,
+              attendeeEmail,
+            }
           );
 
           return res.json({
             received: true,
             bookingCreated: false,
-            message:
-              "Missing event booking metadata",
+            message: "Missing event booking metadata",
           });
         }
 
+        // ----------------------------------------------------
+        // 5. Validate event ID
+        // ----------------------------------------------------
+
         if (!isValidId(eventId)) {
           console.error(
-            "Invalid event ID:",
+            "❌ Invalid event ID:",
             eventId
           );
 
@@ -153,9 +225,11 @@ app.post("/api/payments/webhook", async (req, res) => {
           });
         }
 
-        // ------------------------------------------
-        // Prevent duplicate booking
-        // ------------------------------------------
+        const eventObjectId = new ObjectId(eventId);
+
+        // ----------------------------------------------------
+        // 6. Check duplicate booking
+        // ----------------------------------------------------
 
         const existingBooking =
           await bookingCollection.findOne({
@@ -164,29 +238,31 @@ app.post("/api/payments/webhook", async (req, res) => {
 
         if (existingBooking) {
           console.log(
-            "Booking already processed:",
+            "ℹ️ Booking already exists for Stripe session:",
             session.id
           );
 
           return res.json({
             received: true,
             bookingCreated: false,
+            alreadyExists: true,
+            bookingId: existingBooking._id,
             message: "Booking already processed",
           });
         }
 
-        // ------------------------------------------
-        // Find event
-        // ------------------------------------------
+        // ----------------------------------------------------
+        // 7. Find event
+        // ----------------------------------------------------
 
         const eventData =
           await eventsCollection.findOne({
-            _id: new ObjectId(eventId),
+            _id: eventObjectId,
           });
 
         if (!eventData) {
           console.error(
-            "Event not found:",
+            "❌ Event not found:",
             eventId
           );
 
@@ -197,35 +273,92 @@ app.post("/api/payments/webhook", async (req, res) => {
           });
         }
 
-        // ------------------------------------------
-        // Check available seats
-        // ------------------------------------------
+        // ----------------------------------------------------
+        // 8. Check event status
+        // ----------------------------------------------------
 
-        const availableSeats =
-          Number(eventData.seats) || 0;
-
-        if (
-          availableSeats < quantity
-        ) {
+        if (eventData.status !== "approved") {
           console.error(
-            `Not enough seats for event ${eventId}. Available: ${availableSeats}, Requested: ${quantity}`
+            "❌ Event is not approved:",
+            eventId
           );
 
           return res.json({
             received: true,
             bookingCreated: false,
-            message: "Not enough seats available",
+            message: "Event is not available",
           });
         }
 
-        // ------------------------------------------
-        // Atomically decrease seats
-        // ------------------------------------------
+        // ----------------------------------------------------
+        // 9. Make sure event is paid
+        // ----------------------------------------------------
+
+        const ticketPrice =
+          Number(eventData.ticketPrice) || 0;
+
+        if (ticketPrice <= 0) {
+          console.error(
+            "❌ Event ticket price is invalid:",
+            ticketPrice
+          );
+
+          return res.json({
+            received: true,
+            bookingCreated: false,
+            message: "Invalid event ticket price",
+          });
+        }
+
+        // ----------------------------------------------------
+        // 10. Calculate total amount from event price
+        // ----------------------------------------------------
+
+        const expectedTotal =
+          ticketPrice * quantity;
+
+        const stripeTotal =
+          Number(session.amount_total || 0) / 100;
+
+        const totalAmount =
+          metadataTotalAmount > 0
+            ? metadataTotalAmount
+            : stripeTotal;
+
+        // ----------------------------------------------------
+        // 11. Validate Stripe amount
+        // ----------------------------------------------------
+
+        if (
+          Math.abs(stripeTotal - expectedTotal) > 0.01
+        ) {
+          console.error(
+            "❌ Stripe amount mismatch",
+            {
+              eventId,
+              quantity,
+              ticketPrice,
+              expectedTotal,
+              stripeTotal,
+            }
+          );
+
+          return res.json({
+            received: true,
+            bookingCreated: false,
+            message: "Payment amount mismatch",
+          });
+        }
+
+        // ----------------------------------------------------
+        // 12. Reserve seats atomically
+        // ----------------------------------------------------
 
         const seatUpdate =
           await eventsCollection.updateOne(
             {
-              _id: new ObjectId(eventId),
+              _id: eventObjectId,
+              status: "approved",
               seats: {
                 $gte: quantity,
               },
@@ -237,57 +370,57 @@ app.post("/api/payments/webhook", async (req, res) => {
             }
           );
 
-        if (
-          seatUpdate.modifiedCount !== 1
-        ) {
+        if (seatUpdate.modifiedCount !== 1) {
           console.error(
-            "Failed to reserve event seats:",
-            eventId
+            "❌ Unable to reserve seats",
+            {
+              eventId,
+              quantity,
+            }
           );
 
           return res.json({
             received: true,
             bookingCreated: false,
-            message:
-              "Unable to reserve seats",
+            message: "Not enough seats available",
           });
         }
 
-        // ------------------------------------------
-        // Generate transaction ID on server
-        // ------------------------------------------
+        console.log(
+          `✅ Reserved ${quantity} seat(s) for event ${eventId}`
+        );
+
+        // ----------------------------------------------------
+        // 13. Get Stripe Payment Intent
+        // ----------------------------------------------------
+
+        const stripePaymentIntentId =
+          typeof session.payment_intent === "string"
+            ? session.payment_intent
+            : session.payment_intent?.id || null;
+
+        // ----------------------------------------------------
+        // 14. Generate transaction ID
+        // ----------------------------------------------------
 
         const transactionId =
           `TXN-${Date.now()}-${Math.floor(
             1000 + Math.random() * 9000
           )}`;
 
-        // ------------------------------------------
-        // Get Stripe payment intent
-        // ------------------------------------------
-
-        const stripePaymentIntentId =
-          typeof session.payment_intent ===
-          "string"
-            ? session.payment_intent
-            : session.payment_intent?.id ||
-              null;
-
-        // ------------------------------------------
-        // Create booking
-        // ------------------------------------------
+        // ----------------------------------------------------
+        // 15. Create booking
+        // ----------------------------------------------------
 
         const bookingData = {
           eventId: String(eventId),
 
-          eventTitle: String(
-            eventTitle
-          ),
+          eventTitle: String(eventTitle),
 
           attendeeEmail:
-            String(
-              attendeeEmail
-            ).toLowerCase(),
+            String(attendeeEmail)
+              .trim()
+              .toLowerCase(),
 
           quantity,
 
@@ -297,8 +430,7 @@ app.post("/api/payments/webhook", async (req, res) => {
 
           transactionId,
 
-          stripeSessionId:
-            session.id,
+          stripeSessionId: session.id,
 
           stripePaymentIntentId,
 
@@ -307,471 +439,182 @@ app.post("/api/payments/webhook", async (req, res) => {
           createdAt: new Date(),
         };
 
-        await bookingCollection.insertOne(
-          bookingData
-        );
+        // ----------------------------------------------------
+        // 16. Insert booking
+        // ----------------------------------------------------
 
-        console.log(
-          "Event ticket booking created successfully:",
-          {
-            stripeSessionId:
-              session.id,
-            eventId,
-            attendeeEmail,
-            quantity,
-            amount: totalAmount,
-            transactionId,
-          }
-        );
+        try {
+          const result =
+            await bookingCollection.insertOne(
+              bookingData
+            );
 
-        return res.json({
-          received: true,
-          bookingCreated: true,
-          message:
-            "Event ticket booking created successfully",
-        });
-      }
-
-      // ==================================================
-      // SUBSCRIPTION PAYMENT
-      // ==================================================
-
-      if (
-        paymentType === "subscription" ||
-        session.metadata?.planId
-      ) {
-        const planId =
-          session.metadata?.planId;
-
-        const customerEmail =
-          session.customer_details?.email ||
-          session.customer_email;
-
-        const customerId =
-          typeof session.customer ===
-          "string"
-            ? session.customer
-            : session.customer?.id ||
-              null;
-
-        const subscriptionId =
-          typeof session.subscription ===
-          "string"
-            ? session.subscription
-            : session.subscription?.id ||
-              null;
-
-        // ------------------------------------------
-        // Validate plan ID
-        // ------------------------------------------
-
-        if (!planId) {
-          console.error(
-            "Stripe checkout session has no planId metadata"
-          );
-
-          return res.json({
-            received: true,
-            message:
-              "Missing planId metadata",
-          });
-        }
-
-        // ------------------------------------------
-        // Validate customer email
-        // ------------------------------------------
-
-        if (!customerEmail) {
-          console.error(
-            "Stripe checkout session has no customer email"
-          );
-
-          return res.json({
-            received: true,
-            message:
-              "Missing customer email",
-          });
-        }
-
-        const normalizedEmail =
-          customerEmail.toLowerCase();
-
-        // ------------------------------------------
-        // Find purchased plan
-        // ------------------------------------------
-
-        const purchasedPlan =
-          await plansCollection.findOne({
-            planId,
-            active: true,
-          });
-
-        if (!purchasedPlan) {
-          console.error(
-            `Plan not found: ${planId}`
-          );
-
-          return res.json({
-            received: true,
-            message: "Plan not found",
-          });
-        }
-
-        // ------------------------------------------
-        // Prevent duplicate payment records
-        // ------------------------------------------
-
-        const existingPayment =
-          await paymentsCollection.findOne({
-            stripeSessionId:
-              session.id,
-          });
-
-        if (existingPayment) {
           console.log(
-            "Payment already processed:",
+            "=============================================="
+          );
+
+          console.log(
+            "✅ EVENT BOOKING CREATED SUCCESSFULLY"
+          );
+
+          console.log(
+            "Booking ID:",
+            result.insertedId
+          );
+
+          console.log(
+            "Stripe Session:",
             session.id
           );
 
-          return res.json({
-            received: true,
-            message:
-              "Payment already processed",
-          });
-        }
-
-        // ------------------------------------------
-        // Save payment information
-        // ------------------------------------------
-
-        const paymentData = {
-          stripeSessionId:
-            session.id,
-
-          stripePaymentIntentId:
-            typeof session.payment_intent ===
-            "string"
-              ? session.payment_intent
-              : session.payment_intent?.id ||
-                null,
-
-          stripeCustomerId:
-            customerId,
-
-          stripeSubscriptionId:
-            subscriptionId,
-
-          organizerEmail:
-            normalizedEmail,
-
-          planId:
-            purchasedPlan.planId,
-
-          planName:
-            purchasedPlan.name,
-
-          amount:
-            session.amount_total
-              ? session.amount_total / 100
-              : Number(
-                  purchasedPlan.price
-                ) || 0,
-
-          currency: "USD",
-
-          paymentStatus:
-            "completed",
-
-          paymentType:
-            "subscription",
-
-          billingPeriod:
-            purchasedPlan.billingPeriod ||
-            "monthly",
-
-          maxEvents:
-            purchasedPlan.maxEvents,
-
-          unlimitedEvents:
-            purchasedPlan.unlimitedEvents,
-
-          createdAt:
-            new Date(),
-
-          updatedAt:
-            new Date(),
-        };
-
-        await paymentsCollection.insertOne(
-          paymentData
-        );
-
-        console.log(
-          "Subscription payment saved successfully:",
-          session.id
-        );
-
-        // ------------------------------------------
-        // Find organizer organization
-        // ------------------------------------------
-
-        const organization =
-          await organizationCollection.findOne({
-            organizerEmail:
-              normalizedEmail,
-          });
-
-        if (!organization) {
-          console.error(
-            "Organization not found for:",
-            normalizedEmail
+          console.log(
+            "Event:",
+            eventTitle
           );
 
-          return res.json({
+          console.log(
+            "Attendee:",
+            attendeeEmail
+          );
+
+          console.log(
+            "Quantity:",
+            quantity
+          );
+
+          console.log(
+            "Amount:",
+            totalAmount
+          );
+
+          console.log(
+            "Transaction:",
+            transactionId
+          );
+
+          console.log(
+            "=============================================="
+          );
+
+          return res.status(200).json({
             received: true,
-            paymentSaved: true,
-            organizationUpdated: false,
+            bookingCreated: true,
+            insertedId: result.insertedId,
+            message:
+              "Event ticket booking created successfully",
+          });
+        } catch (insertError) {
+          // --------------------------------------------------
+          // Roll back seats if MongoDB insert fails
+          // --------------------------------------------------
+
+          console.error(
+            "❌ BOOKING INSERT FAILED:",
+            insertError
+          );
+
+          await eventsCollection.updateOne(
+            {
+              _id: eventObjectId,
+            },
+            {
+              $inc: {
+                seats: quantity,
+              },
+            }
+          );
+
+          console.log(
+            `↩️ Rolled back ${quantity} seat(s)`
+          );
+
+          // Duplicate Stripe session
+          // can happen because webhook was retried.
+          if (
+            insertError?.code === 11000
+          ) {
+            const existingBooking =
+              await bookingCollection.findOne({
+                stripeSessionId: session.id,
+              });
+
+            return res.status(200).json({
+              received: true,
+              bookingCreated: false,
+              alreadyExists: true,
+              bookingId:
+                existingBooking?._id || null,
+              message:
+                "Booking already exists",
+            });
+          }
+
+          return res.status(500).json({
+            received: true,
+            bookingCreated: false,
+            message:
+              "Failed to save booking",
           });
         }
-
-        // ------------------------------------------
-        // Update organization plan
-        // ------------------------------------------
-
-        const currentMaxEvents =
-          organization.maxEvents || 0;
-
-        const newMaxEvents =
-          purchasedPlan.unlimitedEvents
-            ? currentMaxEvents
-            : currentMaxEvents +
-              purchasedPlan.maxEvents;
-
-        const newUnlimitedEvents =
-          organization.unlimitedEvents ||
-          purchasedPlan.unlimitedEvents;
-
-        await organizationCollection.updateOne(
-          {
-            _id: organization._id,
-          },
-          {
-            $set: {
-              planId:
-                purchasedPlan.planId,
-
-              planName:
-                purchasedPlan.name,
-
-              maxEvents:
-                newMaxEvents,
-
-              unlimitedEvents:
-                newUnlimitedEvents,
-
-              planStatus:
-                "active",
-
-              stripeCustomerId:
-                customerId,
-
-              stripeSubscriptionId:
-                subscriptionId,
-
-              updatedAt:
-                new Date(),
-            },
-          }
+      } catch (error) {
+        console.error(
+          "❌ Event ticket webhook processing error:",
+          error
         );
 
-        console.log(
-          `Organization plan updated: ${purchasedPlan.name} (maxEvents ${currentMaxEvents} -> ${newMaxEvents})`
-        );
-
-        // ------------------------------------------
-        // Update organizer user plan
-        // ------------------------------------------
-
-        await userCollection.updateOne(
-          {
-            email:
-              normalizedEmail,
-          },
-          {
-            $set: {
-              plan:
-                purchasedPlan.planId,
-
-              updatedAt:
-                new Date(),
-            },
-          }
-        );
-
-        console.log(
-          `User plan updated: ${normalizedEmail} -> ${purchasedPlan.planId}`
-        );
-
-        return res.json({
+        return res.status(500).json({
           received: true,
-          paymentSaved: true,
-          organizationUpdated: true,
+          bookingCreated: false,
+          message:
+            "Webhook processing failed",
         });
       }
-
-      // ==================================================
-      // UNKNOWN PAYMENT TYPE
-      // ==================================================
-
-      console.warn(
-        "Unknown Stripe payment type:",
-        paymentType
-      );
-
-      return res.json({
-        received: true,
-        message:
-          "Unknown payment type",
-      });
     }
 
-    // ==========================================
-    // CHECKOUT EXPIRED
-    // ==========================================
-
-    if (
-      event.type ===
-      "checkout.session.expired"
-    ) {
-      const session =
-        event.data.object;
-
-      await paymentsCollection.updateOne(
-        {
-          stripeSessionId:
-            session.id,
-        },
-        {
-          $set: {
-            paymentStatus:
-              "expired",
-
-            updatedAt:
-              new Date(),
-          },
-        }
-      );
-
-      console.log(
-        "Stripe checkout session expired:",
-        session.id
-      );
-
-      return res.json({
-        received: true,
-      });
-    }
-
-    // ==========================================
-    // SUBSCRIPTION DELETED
-    // ==========================================
-
-    if (
-      event.type ===
-      "customer.subscription.deleted"
-    ) {
-      const subscription =
-        event.data.object;
-
-      // ------------------------------------------
-      // Reset organization to free plan
-      // ------------------------------------------
-
-      await organizationCollection.updateOne(
-        {
-          stripeSubscriptionId:
-            subscription.id,
-        },
-        {
-          $set: {
-            planId: "free",
-
-            planName: "Free",
-
-            maxEvents: 3,
-
-            unlimitedEvents:
-              false,
-
-            planStatus:
-              "cancelled",
-
-            stripeSubscriptionId:
-              null,
-
-            updatedAt:
-              new Date(),
-          },
-        }
-      );
-
-      // ------------------------------------------
-      // Mark subscription payments cancelled
-      // ------------------------------------------
-
-      await paymentsCollection.updateMany(
-        {
-          stripeSubscriptionId:
-            subscription.id,
-
-          paymentStatus:
-            "completed",
-        },
-        {
-          $set: {
-            paymentStatus:
-              "cancelled",
-
-            updatedAt:
-              new Date(),
-          },
-        }
-      );
-
-      console.log(
-        "Subscription cancelled:",
-        subscription.id
-      );
-
-      return res.json({
-        received: true,
-      });
-    }
-
-    // ==========================================
-    // OTHER STRIPE EVENTS
-    // ==========================================
+    // ========================================================
+    // OTHER STRIPE PAYMENT TYPES
+    // ========================================================
 
     console.log(
-      "Unhandled Stripe event:",
-      event.type
+      "ℹ️ Non-event payment received:",
+      paymentType
     );
 
-    return res.json({
+    return res.status(200).json({
       received: true,
-    });
-  } catch (error) {
-    console.error(
-      "Stripe webhook processing error:",
-      error
-    );
-
-    return res.status(500).json({
-      success: false,
-      message:
-        "Failed to process Stripe webhook",
+      message: "Stripe event received",
     });
   }
+
+  // ==========================================================
+  // CHECKOUT SESSION EXPIRED
+  // ==========================================================
+
+  if (
+    stripeEvent.type ===
+    "checkout.session.expired"
+  ) {
+    const session = stripeEvent.data.object;
+
+    console.log(
+      "Stripe checkout session expired:",
+      session.id
+    );
+
+    return res.status(200).json({
+      received: true,
+      message: "Checkout session expired",
+    });
+  }
+
+  // ==========================================================
+  // OTHER STRIPE EVENTS
+  // ==========================================================
+
+  return res.status(200).json({
+    received: true,
+    message: "Stripe event received",
+  });
 });
 
 
@@ -2108,101 +1951,278 @@ app.delete("/api/admin/events/:id", async (req, res) => {
 // ADMIN TRANSACTIONS
 // ==========================================
 
+// ======================================================
+// ADMIN - ALL TRANSACTIONS
+// Organizer payments + attendee ticket bookings
+// ======================================================
 app.get("/api/admin/transactions", async (req, res) => {
   try {
-    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    // ------------------------------------------
+    // 1. Get organizer payments
+    // ------------------------------------------
+    const organizerPayments =
+      await paymentsCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
 
-    const limit = Math.min(
-      Math.max(parseInt(req.query.limit) || 10, 1),
-      50
+    // ------------------------------------------
+    // 2. Get attendee bookings
+    // ------------------------------------------
+    const attendeeBookings =
+      await bookingCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
+
+    // ------------------------------------------
+    // 3. Get users for names
+    // ------------------------------------------
+    const users = await userCollection
+      .find(
+        {},
+        {
+          projection: {
+            name: 1,
+            email: 1,
+          },
+        }
+      )
+      .toArray();
+
+    const userMap = new Map();
+
+    users.forEach((user) => {
+      if (user.email) {
+        userMap.set(
+          String(user.email).trim().toLowerCase(),
+          user.name || "Unknown User"
+        );
+      }
+    });
+
+    // ------------------------------------------
+    // 4. Format organizer payments
+    // ------------------------------------------
+    const formattedOrganizerPayments =
+      organizerPayments.map((payment) => {
+        const email = String(
+          payment.organizerEmail || ""
+        )
+          .trim()
+          .toLowerCase();
+
+        return {
+          id:
+            payment.stripePaymentIntentId ||
+            payment.stripeSessionId ||
+            `PAY-${payment._id}`,
+
+          user:
+            userMap.get(email) ||
+            email ||
+            "Unknown User",
+
+          email,
+
+          event:
+            payment.paymentType === "subscription"
+              ? `${payment.planName || "Plan"} Subscription`
+              : "Organizer Payment",
+
+          amount: Number(payment.amount || 0),
+
+          currency:
+            payment.currency || "usd",
+
+          method: "Card",
+
+          status:
+            payment.paymentStatus === "completed"
+              ? "Completed"
+              : payment.paymentStatus === "paid"
+              ? "Completed"
+              : payment.paymentStatus === "pending"
+              ? "Pending"
+              : payment.paymentStatus
+              ? String(payment.paymentStatus)
+                  .charAt(0)
+                  .toUpperCase() +
+                String(payment.paymentStatus).slice(1)
+              : "Pending",
+
+          type: "Organizer",
+
+          paymentType:
+            payment.paymentType || "payment",
+
+          planName:
+            payment.planName || null,
+
+          billingPeriod:
+            payment.billingPeriod || null,
+
+          date:
+            payment.createdAt ||
+            payment.updatedAt ||
+            null,
+
+          createdAt:
+            payment.createdAt ||
+            payment.updatedAt ||
+            null,
+        };
+      });
+
+    // ------------------------------------------
+    // 5. Format attendee bookings
+    // ------------------------------------------
+    const formattedAttendeeBookings =
+      attendeeBookings.map((booking) => {
+        const email = String(
+          booking.attendeeEmail || ""
+        )
+          .trim()
+          .toLowerCase();
+
+        return {
+          id:
+            booking.transactionId ||
+            `BOOK-${booking._id}`,
+
+          user:
+            userMap.get(email) ||
+            email ||
+            "Unknown User",
+
+          email,
+
+          event:
+            booking.eventTitle ||
+            "Unknown Event",
+
+          amount:
+            Number(booking.amount || 0),
+
+          currency: "usd",
+
+          method: "Card",
+
+          status:
+            booking.paymentStatus === "paid"
+              ? "Completed"
+              : booking.paymentStatus ===
+                "completed"
+              ? "Completed"
+              : booking.paymentStatus
+              ? String(
+                  booking.paymentStatus
+                )
+                  .charAt(0)
+                  .toUpperCase() +
+                String(
+                  booking.paymentStatus
+                ).slice(1)
+              : "Pending",
+
+          type: "Attendee",
+
+          paymentType: "event_ticket",
+
+          quantity:
+            Number(booking.quantity || 1),
+
+          planName: null,
+
+          billingPeriod: null,
+
+          stripeSessionId:
+            booking.stripeSessionId || null,
+
+          stripePaymentIntentId:
+            booking.stripePaymentIntentId ||
+            null,
+
+          date:
+            booking.bookingDate ||
+            booking.createdAt ||
+            null,
+
+          createdAt:
+            booking.bookingDate ||
+            booking.createdAt ||
+            null,
+        };
+      });
+
+    // ------------------------------------------
+    // 6. Combine both
+    // ------------------------------------------
+    const transactions = [
+      ...formattedOrganizerPayments,
+      ...formattedAttendeeBookings,
+    ];
+
+    // ------------------------------------------
+    // 7. Sort newest first
+    // ------------------------------------------
+    transactions.sort((a, b) => {
+      return (
+        new Date(b.createdAt || 0) -
+        new Date(a.createdAt || 0)
+      );
+    });
+
+    // ------------------------------------------
+    // 8. Stats
+    // ------------------------------------------
+    const totalRevenue = transactions.reduce(
+      (total, transaction) => {
+        if (
+          transaction.status === "Completed"
+        ) {
+          return (
+            total +
+            Number(transaction.amount || 0)
+          );
+        }
+
+        return total;
+      },
+      0
     );
 
-    const search = req.query.search?.trim() || "";
-    const status = req.query.status || "";
+    const completed = transactions.filter(
+      (transaction) =>
+        transaction.status === "Completed"
+    ).length;
 
-    const query = {};
+    const pending = transactions.filter(
+      (transaction) =>
+        transaction.status === "Pending"
+    ).length;
 
-    if (search) {
-      const escapedSearch = search.replace(
-        /[.*+?^${}()|[\]\\]/g,
-        "\\$&"
-      );
+    return res.status(200).json({
+      success: true,
 
-      query.$or = [
-        {
-          transactionId: {
-            $regex: escapedSearch,
-            $options: "i",
-          },
-        },
-        {
-          attendeeEmail: {
-            $regex: escapedSearch,
-            $options: "i",
-          },
-        },
-        {
-          eventTitle: {
-            $regex: escapedSearch,
-            $options: "i",
-          },
-        },
-      ];
-    }
+      stats: {
+        totalRevenue,
+        completed,
+        pending,
+      },
 
-    if (status) {
-      query.paymentStatus = status;
-    }
-
-    const [transactions, total, revenueResult] =
-      await Promise.all([
-        bookingCollection
-          .find(query)
-          .sort({
-            createdAt: -1,
-          })
-          .skip((page - 1) * limit)
-          .limit(limit)
-          .toArray(),
-
-        bookingCollection.countDocuments(query),
-
-        bookingCollection
-          .aggregate([
-            {
-              $match: query,
-            },
-            {
-              $group: {
-                _id: null,
-                totalRevenue: {
-                  $sum: {
-                    $convert: {
-                      input: "$amount",
-                      to: "double",
-                      onError: 0,
-                      onNull: 0,
-                    },
-                  },
-                },
-              },
-            },
-          ])
-          .toArray(),
-      ]);
-
-    res.json({
       transactions,
-      total,
-      page,
-      totalPages: Math.max(Math.ceil(total / limit), 1),
-      totalRevenue: revenueResult[0]?.totalRevenue || 0,
     });
   } catch (error) {
-    console.error("Admin transactions error:", error);
+    console.error(
+      "❌ Failed to load admin transactions:",
+      error
+    );
 
-    res.status(500).json({
-      message: "Failed to fetch transactions",
+    return res.status(500).json({
+      success: false,
+      message:
+        "Failed to load transactions",
     });
   }
 });
@@ -2211,51 +2231,126 @@ app.get("/api/admin/transactions", async (req, res) => {
 // ADMIN ANALYTICS
 // ==========================================
 
+// ======================================================
+// ADMIN - ANALYTICS
+// ======================================================
 app.get("/api/admin/analytics", async (req, res) => {
   try {
+    // ====================================================
+    // 1. BASIC COUNTS
+    // ====================================================
+
     const [
-      monthlyUsers,
-      monthlyBookings,
-      categoryStats,
-      eventStatusStats,
-      revenueStats,
+      totalUsers,
+      totalEvents,
+      totalBookings,
     ] = await Promise.all([
-      // Users by month
-      userCollection
+      userCollection.countDocuments({}),
+      eventsCollection.countDocuments({}),
+      bookingCollection.countDocuments({}),
+    ]);
+
+    // ====================================================
+    // 2. REVENUE
+    // ====================================================
+
+    const [
+      organizerRevenueResult,
+      attendeeRevenueResult,
+    ] = await Promise.all([
+      paymentsCollection
         .aggregate([
           {
             $match: {
-              createdAt: {
-                $exists: true,
+              paymentStatus: {
+                $in: ["completed", "paid"],
               },
             },
           },
           {
             $group: {
-              _id: {
-                $dateToString: {
-                  format: "%Y-%m",
-                  date: "$createdAt",
+              _id: null,
+              total: {
+                $sum: {
+                  $toDouble: "$amount",
                 },
               },
-              users: {
-                $sum: 1,
-              },
-            },
-          },
-          {
-            $sort: {
-              _id: 1,
             },
           },
         ])
         .toArray(),
 
-      // Bookings by month
       bookingCollection
         .aggregate([
           {
             $match: {
+              paymentStatus: {
+                $in: ["completed", "paid"],
+              },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              total: {
+                $sum: {
+                  $toDouble: "$amount",
+                },
+              },
+            },
+          },
+        ])
+        .toArray(),
+    ]);
+
+    const organizerRevenue =
+      Number(
+        organizerRevenueResult[0]?.total || 0
+      );
+
+    const attendeeRevenue =
+      Number(
+        attendeeRevenueResult[0]?.total || 0
+      );
+
+    const totalRevenue =
+      organizerRevenue + attendeeRevenue;
+
+    // ====================================================
+    // 3. LAST 6 MONTHS
+    // ====================================================
+
+    const now = new Date();
+
+    const months = [];
+
+    for (let i = 5; i >= 0; i--) {
+      const date = new Date(
+        now.getFullYear(),
+        now.getMonth() - i,
+        1
+      );
+
+      months.push({
+        year: date.getFullYear(),
+        month: date.getMonth(),
+        label: date.toLocaleString("en-US", {
+          month: "short",
+        }),
+        users: 0,
+        bookings: 0,
+      });
+    }
+
+    // ====================================================
+    // 4. USERS BY MONTH
+    // ====================================================
+
+    const userGrowth =
+      await userCollection
+        .aggregate([
+          {
+            $match: {
               createdAt: {
                 $exists: true,
               },
@@ -2264,27 +2359,111 @@ app.get("/api/admin/analytics", async (req, res) => {
           {
             $group: {
               _id: {
-                $dateToString: {
-                  format: "%Y-%m",
-                  date: "$createdAt",
+                year: {
+                  $year: "$createdAt",
+                },
+                month: {
+                  $month: "$createdAt",
                 },
               },
-              bookings: {
+              count: {
                 $sum: 1,
               },
             },
           },
+        ])
+        .toArray();
+
+    userGrowth.forEach((item) => {
+      const target = months.find(
+        (month) =>
+          month.year === item._id.year &&
+          month.month === item._id.month - 1
+      );
+
+      if (target) {
+        target.users = item.count;
+      }
+    });
+
+    // ====================================================
+    // 5. BOOKINGS BY MONTH
+    // ====================================================
+
+    const bookingGrowth =
+      await bookingCollection
+        .aggregate([
           {
-            $sort: {
-              _id: 1,
+            $match: {
+              $or: [
+                {
+                  bookingDate: {
+                    $exists: true,
+                  },
+                },
+                {
+                  createdAt: {
+                    $exists: true,
+                  },
+                },
+              ],
+            },
+          },
+          {
+            $project: {
+              date: {
+                $ifNull: [
+                  "$bookingDate",
+                  "$createdAt",
+                ],
+              },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                year: {
+                  $year: "$date",
+                },
+                month: {
+                  $month: "$date",
+                },
+              },
+              count: {
+                $sum: 1,
+              },
             },
           },
         ])
-        .toArray(),
+        .toArray();
 
-      // Events by category
-      eventsCollection
+    bookingGrowth.forEach((item) => {
+      const target = months.find(
+        (month) =>
+          month.year === item._id.year &&
+          month.month === item._id.month - 1
+      );
+
+      if (target) {
+        target.bookings = item.count;
+      }
+    });
+
+    // ====================================================
+    // 6. EVENT CATEGORIES
+    // ====================================================
+
+    const categoryData =
+      await eventsCollection
         .aggregate([
+          {
+            $match: {
+              category: {
+                $exists: true,
+                $ne: "",
+              },
+            },
+          },
           {
             $group: {
               _id: "$category",
@@ -2299,77 +2478,60 @@ app.get("/api/admin/analytics", async (req, res) => {
             },
           },
         ])
-        .toArray(),
+        .toArray();
 
-      // Event status
-      eventsCollection
-        .aggregate([
-          {
-            $group: {
-              _id: "$status",
-              count: {
-                $sum: 1,
-              },
-            },
-          },
-        ])
-        .toArray(),
+    const totalCategorizedEvents =
+      categoryData.reduce(
+        (total, category) =>
+          total + category.count,
+        0
+      );
 
-      // Revenue by month
-      bookingCollection
-        .aggregate([
-          {
-            $match: {
-              createdAt: {
-                $exists: true,
-              },
-            },
-          },
-          {
-            $group: {
-              _id: {
-                $dateToString: {
-                  format: "%Y-%m",
-                  date: "$createdAt",
-                },
-              },
-              revenue: {
-                $sum: {
-                  $convert: {
-                    input: "$amount",
-                    to: "double",
-                    onError: 0,
-                    onNull: 0,
-                  },
-                },
-              },
-            },
-          },
-          {
-            $sort: {
-              _id: 1,
-            },
-          },
-        ])
-        .toArray(),
-    ]);
+    const categories =
+      categoryData.map((category) => ({
+        name: category._id,
+        count: category.count,
+        percentage:
+          totalCategorizedEvents > 0
+            ? Math.round(
+                (category.count /
+                  totalCategorizedEvents) *
+                  100
+              )
+            : 0,
+      }));
 
-    res.json({
-      monthlyUsers,
-      monthlyBookings,
-      categoryStats,
-      eventStatusStats,
-      revenueStats,
+    // ====================================================
+    // 7. RESPONSE
+    // ====================================================
+
+    return res.status(200).json({
+      success: true,
+
+      stats: {
+        users: totalUsers,
+        events: totalEvents,
+        bookings: totalBookings,
+        revenue: totalRevenue,
+      },
+
+      monthlyData: months,
+
+      categories,
     });
   } catch (error) {
-    console.error("Admin analytics error:", error);
+    console.error(
+      "❌ Failed to load admin analytics:",
+      error
+    );
 
-    res.status(500).json({
-      message: "Failed to fetch analytics",
+    return res.status(500).json({
+      success: false,
+      message:
+        "Failed to load analytics",
     });
   }
 });
-
 app.get("/api/plans", async (req, res) => {
   try {
     const plans = await plansCollection
@@ -2427,112 +2589,205 @@ app.get("/api/payments/checkout-session/:sessionId", async (req, res) => {
 
 
     // ---------- CREATE BOOKING ----------
- app.post("/api/bookings", async (req, res) => {
-  try {
-    const {
-      eventId,
-      eventTitle,
-      attendeeEmail,
-      quantity,
-      amount,
-      paymentStatus,
-      transactionId,
-      bookingDate,
-    } = req.body;
+// ---------- CREATE FREE BOOKING ----------
+// app.post("/api/bookings", async (req, res) => {
+//   try {
+//     const {
+//       eventId,
+//       eventTitle,
+//       attendeeEmail,
+//       quantity,
+//     } = req.body;
 
-    if (!eventId || !eventTitle || !attendeeEmail) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Missing required booking details (eventId, eventTitle, attendeeEmail)",
-      });
-    }
+//     if (!eventId || !eventTitle || !attendeeEmail) {
+//       return res.status(400).json({
+//         success: false,
+//         message:
+//           "Missing required booking details (eventId, eventTitle, attendeeEmail)",
+//       });
+//     }
 
-    const requestedQuantity = Number(quantity) || 1;
-    const bookingAmount = Number(amount) || 0;
+//     const requestedQuantity = Number(quantity);
 
-    const finalTxnId =
-      transactionId ||
-      `TXN-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+//     if (
+//       !Number.isInteger(requestedQuantity) ||
+//       requestedQuantity < 1
+//     ) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Quantity must be at least 1.",
+//       });
+//     }
 
-    // Check event and available seats
-    if (isValidId(eventId)) {
-      const event = await eventsCollection.findOne({
-        _id: new ObjectId(eventId),
-      });
+//     if (!isValidId(eventId)) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Invalid event ID.",
+//       });
+//     }
 
-      if (!event) {
-        return res.status(404).json({
-          success: false,
-          message: "Event not found",
-        });
-      }
+//     const eventObjectId = new ObjectId(eventId);
 
-      if (event.seats < requestedQuantity) {
+//     // ------------------------------------------
+//     // ATOMICALLY RESERVE SEATS
+//     // ------------------------------------------
+
+//     const seatUpdate = await eventsCollection.updateOne(
+//       {
+//         _id: eventObjectId,
+//         status: "approved",
+//         seats: {
+//           $gte: requestedQuantity,
+//         },
+//         ticketPrice: 0,
+//       },
+//       {
+//         $inc: {
+//           seats: -requestedQuantity,
+//         },
+//       },
+//     );
+
+//     if (seatUpdate.modifiedCount !== 1) {
+//       const event = await eventsCollection.findOne({
+//         _id: eventObjectId,
+//       });
+
+//       if (!event) {
+//         return res.status(404).json({
+//           success: false,
+//           message: "Event not found.",
+//         });
+//       }
+
+//       if (event.status !== "approved") {
+//         return res.status(400).json({
+//           success: false,
+//           message: "This event is not available for booking.",
+//         });
+//       }
+
+//       if (Number(event.ticketPrice) !== 0) {
+//         return res.status(400).json({
+//           success: false,
+//           message:
+//             "This is a paid event. Please complete payment through Stripe.",
+//         });
+//       }
+
+//       return res.status(400).json({
+//         success: false,
+//         message: `Not enough seats available. Only ${
+//           event.seats || 0
+//         } seats left.`,
+//       });
+//     }
+
+//     // ------------------------------------------
+//     // CREATE BOOKING
+//     // ------------------------------------------
+
+//     const finalTxnId = `TXN-${Date.now()}-${Math.floor(
+//       1000 + Math.random() * 9000,
+//     )}`;
+
+//     const newBooking = {
+//       eventId: String(eventId),
+//       eventTitle: String(eventTitle),
+//       attendeeEmail: attendeeEmail.toLowerCase(),
+//       quantity: requestedQuantity,
+
+//       // Free event
+//       amount: 0,
+//       paymentStatus: "paid",
+
+//       transactionId: finalTxnId,
+//       bookingDate: new Date(),
+//       createdAt: new Date(),
+//     };
+
+//     try {
+//       const result = await bookingCollection.insertOne(newBooking);
+
+//       return res.status(201).json({
+//         success: true,
+//         message: "Booking created successfully",
+//         insertedId: result.insertedId,
+//         booking: newBooking,
+//       });
+//     } catch (insertError) {
+//       // ------------------------------------------
+//       // ROLLBACK SEATS IF BOOKING INSERT FAILS
+//       // ------------------------------------------
+
+//       await eventsCollection.updateOne(
+//         { _id: eventObjectId },
+//         {
+//           $inc: {
+//             seats: requestedQuantity,
+//           },
+//         },
+//       );
+
+//       throw insertError;
+//     }
+//   } catch (error) {
+//     console.error("Create booking error:", error);
+
+//     return res.status(500).json({
+//       success: false,
+//       message: "Failed to create booking",
+//     });
+//   }
+// });
+   // ============================================================
+// GET BOOKINGS BY ATTENDEE EMAIL
+// ============================================================
+
+app.get(
+  "/api/bookings/user/:email",
+  async (req, res) => {
+    try {
+      const email = decodeURIComponent(
+        req.params.email
+      )
+        .trim()
+        .toLowerCase();
+
+      if (!email) {
         return res.status(400).json({
           success: false,
-          message: "Not enough seats available for this event",
+          message: "Email is required",
         });
       }
 
-      // Reduce available seats
-      await eventsCollection.updateOne(
-        { _id: new ObjectId(eventId) },
-        {
-          $inc: {
-            seats: -requestedQuantity,
-          },
-        },
-      );
-    }
-
-    const newBooking = {
-      eventId: String(eventId),
-      eventTitle: String(eventTitle),
-      attendeeEmail: attendeeEmail.toLowerCase(),
-      quantity: requestedQuantity,
-      amount: bookingAmount,
-      paymentStatus: paymentStatus || "paid",
-      transactionId: finalTxnId,
-      bookingDate: bookingDate
-        ? new Date(bookingDate)
-        : new Date(),
-      createdAt: new Date(),
-    };
-
-    const result = await bookingCollection.insertOne(newBooking);
-
-    return res.status(201).json({
-      success: true,
-      message: "Booking created successfully",
-      insertedId: result.insertedId,
-      booking: newBooking,
-    });
-  } catch (error) {
-    console.error("Create booking error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to create booking",
-    });
-  }
-});
-    // ---------- GET BOOKINGS BY ATTENDEE EMAIL ----------
-    app.get("/api/bookings/user/:email", async (req, res) => {
-      try {
-        const email = decodeURIComponent(req.params.email).toLowerCase();
-
-        const userBookings = await bookingCollection
-          .find({ attendeeEmail: email })
-          .sort({ createdAt: -1 })
+      const userBookings =
+        await bookingCollection
+          .find({
+            attendeeEmail: email,
+          })
+          .sort({
+            createdAt: -1,
+          })
           .toArray();
 
-        return res.status(200).json(userBookings);
-      } catch (error) {
-        console.error("Fetch user bookings error:", error);
-        return res.status(500).json({ message: "Failed to fetch bookings" });
-      }
-    });
+      return res.status(200).json(
+        userBookings
+      );
+    } catch (error) {
+      console.error(
+        "Fetch user bookings error:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Failed to fetch bookings",
+      });
+    }
+  }
+);
 
     // ---------- GET ALL BOOKINGS FOR AN ORGANIZER'S EVENTS ----------
     app.get("/api/bookings/organizer/:email", async (req, res) => {
