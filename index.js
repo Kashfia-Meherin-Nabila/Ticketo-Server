@@ -11,6 +11,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const port = process.env.PORT;
 const { MongoClient, ServerApiVersion } = require("mongodb");
 const { ObjectId } = require("mongodb");
+const { createRemoteJWKSet, jwtVerify } = require("jose-cjs");
 
 app.use(cors());
 app.use("/api/payments/webhook", express.raw({ type: "application/json" }));
@@ -26,6 +27,33 @@ const client = new MongoClient(uri, {
     deprecationErrors: true,
   },
 });
+
+const JWKS = createRemoteJWKSet(
+  new URL("http://localhost:3000/api/auth/jwks")
+);
+
+const verifyToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ message: "No token provided" });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    const { payload } = await jwtVerify(token, JWKS);
+    console.log(payload);
+
+    req.user = payload;
+
+    next();
+  } catch (err) {
+    console.error("JWT verification failed:", err.message);
+
+    return res.status(401).json({ message: "Invalid or expired token" });
+  }
+};
 
 async function run() {
   try {
@@ -624,7 +652,7 @@ app.post("/api/payments/webhook", async (req, res) => {
 // ==========================================
 
 app.get(
-  "/api/organizer/overview/:email",
+  "/api/organizer/overview/:email", verifyToken,
   async (req, res) => {
     try {
       const email = decodeURIComponent(
@@ -860,7 +888,7 @@ app.get(
 );
 
     // Getting Organization Info
-    app.get("/api/organization/:email", async (req, res) => {
+    app.get("/api/organization/:email", verifyToken, async (req, res) => {
       try {
         const { email } = req.params;
 
@@ -879,7 +907,7 @@ app.get(
     });
 
     // Post Organization in DB
-   app.post("/api/organization", async (req, res) => {
+   app.post("/api/organization", verifyToken, async (req, res) => {
   try {
     const {
       organizationName,
@@ -966,7 +994,7 @@ app.get(
   }
 });
     // Updated organization info
-    app.patch("/api/organization/:id", async (req, res) => {
+    app.patch("/api/organization/:id", verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -1003,7 +1031,7 @@ app.get(
     });
 
     // add-Event
-    app.get("/api/events/organization/:organizationId", async (req, res) => {
+    app.get("/api/events/organization/:organizationId", verifyToken, async (req, res) => {
       try {
         const events = await eventsCollection
           .find({ organizationId: req.params.organizationId })
@@ -1021,7 +1049,7 @@ app.get(
       ObjectId.isValid(id) && String(new ObjectId(id)) === id;
 
    // ---------- CREATE EVENT ----------
-app.post("/api/events", async (req, res) => {
+app.post("/api/events", verifyToken, async (req, res) => {
   try {
     const {
       title,
@@ -1207,7 +1235,7 @@ if (
 });
 
     // ---------- UPDATE ----------
-    app.patch("/api/events/:id", async (req, res) => {
+    app.patch("/api/events/:id", verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
         if (!isValidId(id)) {
@@ -1242,7 +1270,7 @@ if (
     });
 
     // ---------- DELETE ----------
-    app.delete("/api/events/:id", async (req, res) => {
+    app.delete("/api/events/:id", verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
         if (!isValidId(id)) {
@@ -1271,7 +1299,7 @@ if (
     // Only approved events are publicly visible
     // ==========================================
 
-    app.get("/api/events/:id", async (req, res) => {
+    app.get("/api/events/:id",verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -1379,7 +1407,7 @@ if (
     });
 
     // GET events by organizer email (Add this to your backend server file)
-    app.get("/api/events/organizer/:email", async (req, res) => {
+    app.get("/api/events/organizer/:email", verifyToken, async (req, res) => {
       try {
         const { email } = req.params;
         const events = await eventsCollection
@@ -1397,7 +1425,7 @@ if (
     });
 
     // ---------- ATTENDEE OVERVIEW (stats + upcoming tickets) ----------
-    app.get("/api/bookings/overview/:email", async (req, res) => {
+    app.get("/api/bookings/overview/:email",verifyToken, async (req, res) => {
       try {
         const email = decodeURIComponent(req.params.email).toLowerCase();
 
@@ -1473,7 +1501,7 @@ if (
     });
 
 // ---------- GET PAYMENTS BY ORGANIZER EMAIL ----------
-app.get("/api/payments/organizer/:email", async (req, res) => {
+app.get("/api/payments/organizer/:email", verifyToken, async (req, res) => {
   try {
     const email = decodeURIComponent(req.params.email).toLowerCase();
 
@@ -2227,9 +2255,6 @@ app.get("/api/admin/transactions", async (req, res) => {
   }
 });
 
-// ==========================================
-// ADMIN ANALYTICS
-// ==========================================
 
 // ======================================================
 // ADMIN - ANALYTICS
@@ -2588,164 +2613,7 @@ app.get("/api/payments/checkout-session/:sessionId", async (req, res) => {
 });
 
 
-    // ---------- CREATE BOOKING ----------
-// ---------- CREATE FREE BOOKING ----------
-// app.post("/api/bookings", async (req, res) => {
-//   try {
-//     const {
-//       eventId,
-//       eventTitle,
-//       attendeeEmail,
-//       quantity,
-//     } = req.body;
-
-//     if (!eventId || !eventTitle || !attendeeEmail) {
-//       return res.status(400).json({
-//         success: false,
-//         message:
-//           "Missing required booking details (eventId, eventTitle, attendeeEmail)",
-//       });
-//     }
-
-//     const requestedQuantity = Number(quantity);
-
-//     if (
-//       !Number.isInteger(requestedQuantity) ||
-//       requestedQuantity < 1
-//     ) {
-//       return res.status(400).json({
-//         success: false,
-//         message: "Quantity must be at least 1.",
-//       });
-//     }
-
-//     if (!isValidId(eventId)) {
-//       return res.status(400).json({
-//         success: false,
-//         message: "Invalid event ID.",
-//       });
-//     }
-
-//     const eventObjectId = new ObjectId(eventId);
-
-//     // ------------------------------------------
-//     // ATOMICALLY RESERVE SEATS
-//     // ------------------------------------------
-
-//     const seatUpdate = await eventsCollection.updateOne(
-//       {
-//         _id: eventObjectId,
-//         status: "approved",
-//         seats: {
-//           $gte: requestedQuantity,
-//         },
-//         ticketPrice: 0,
-//       },
-//       {
-//         $inc: {
-//           seats: -requestedQuantity,
-//         },
-//       },
-//     );
-
-//     if (seatUpdate.modifiedCount !== 1) {
-//       const event = await eventsCollection.findOne({
-//         _id: eventObjectId,
-//       });
-
-//       if (!event) {
-//         return res.status(404).json({
-//           success: false,
-//           message: "Event not found.",
-//         });
-//       }
-
-//       if (event.status !== "approved") {
-//         return res.status(400).json({
-//           success: false,
-//           message: "This event is not available for booking.",
-//         });
-//       }
-
-//       if (Number(event.ticketPrice) !== 0) {
-//         return res.status(400).json({
-//           success: false,
-//           message:
-//             "This is a paid event. Please complete payment through Stripe.",
-//         });
-//       }
-
-//       return res.status(400).json({
-//         success: false,
-//         message: `Not enough seats available. Only ${
-//           event.seats || 0
-//         } seats left.`,
-//       });
-//     }
-
-//     // ------------------------------------------
-//     // CREATE BOOKING
-//     // ------------------------------------------
-
-//     const finalTxnId = `TXN-${Date.now()}-${Math.floor(
-//       1000 + Math.random() * 9000,
-//     )}`;
-
-//     const newBooking = {
-//       eventId: String(eventId),
-//       eventTitle: String(eventTitle),
-//       attendeeEmail: attendeeEmail.toLowerCase(),
-//       quantity: requestedQuantity,
-
-//       // Free event
-//       amount: 0,
-//       paymentStatus: "paid",
-
-//       transactionId: finalTxnId,
-//       bookingDate: new Date(),
-//       createdAt: new Date(),
-//     };
-
-//     try {
-//       const result = await bookingCollection.insertOne(newBooking);
-
-//       return res.status(201).json({
-//         success: true,
-//         message: "Booking created successfully",
-//         insertedId: result.insertedId,
-//         booking: newBooking,
-//       });
-//     } catch (insertError) {
-//       // ------------------------------------------
-//       // ROLLBACK SEATS IF BOOKING INSERT FAILS
-//       // ------------------------------------------
-
-//       await eventsCollection.updateOne(
-//         { _id: eventObjectId },
-//         {
-//           $inc: {
-//             seats: requestedQuantity,
-//           },
-//         },
-//       );
-
-//       throw insertError;
-//     }
-//   } catch (error) {
-//     console.error("Create booking error:", error);
-
-//     return res.status(500).json({
-//       success: false,
-//       message: "Failed to create booking",
-//     });
-//   }
-// });
-   // ============================================================
-// GET BOOKINGS BY ATTENDEE EMAIL
-// ============================================================
-
-app.get(
-  "/api/bookings/user/:email",
+app.get("/api/bookings/user/:email",verifyToken,
   async (req, res) => {
     try {
       const email = decodeURIComponent(
@@ -2790,7 +2658,7 @@ app.get(
 );
 
     // ---------- GET ALL BOOKINGS FOR AN ORGANIZER'S EVENTS ----------
-    app.get("/api/bookings/organizer/:email", async (req, res) => {
+    app.get("/api/bookings/organizer/:email", verifyToken, async (req, res) => {
       try {
         const email = decodeURIComponent(req.params.email).toLowerCase();
 
@@ -2819,7 +2687,7 @@ app.get(
     });
 
     // ---------- UPDATE BOOKING QUANTITY ----------
-    app.patch("/api/bookings/:id", async (req, res) => {
+    app.patch("/api/bookings/:id",verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
         const { newQuantity } = req.body;
@@ -2898,7 +2766,7 @@ app.get(
     });
 
     // ---------- CANCEL BOOKING ----------
-    app.delete("/api/bookings/:id", async (req, res) => {
+    app.delete("/api/bookings/:id",verifyToken, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -2933,6 +2801,8 @@ app.get(
         return res.status(500).json({ message: "Failed to cancel booking" });
       }
     });
+
+    
 
     // ---------- UPDATE USER PROFILE ----------
 app.patch("/api/users/profile", async (req, res) => {
