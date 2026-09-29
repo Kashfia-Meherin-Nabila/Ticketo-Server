@@ -55,18 +55,41 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
+const verifyAdmin = async (req, res, next) => {
+  try {
+    const email = req.user?.email;
+
+    if (!email) {
+      return res.status(401).json({ message: "Unauthorized access" });
+    }
+
+    const user = await userCollection.findOne({
+      email: String(email).toLowerCase(),
+    });
+
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ message: "Forbidden: Admin access only" });
+    }
+
+    next();
+  } catch (err) {
+    console.error("Admin verification failed:", err);
+    return res.status(500).json({ message: "Failed to verify admin access" });
+  }
+};
+
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
     await client.connect();
 
-    const db = client.db(process.env.DB_NAME);
-    const userCollection = db.collection("user");
-    const organizationCollection = db.collection("organizations");
-    const eventsCollection = db.collection("events");
-    const bookingCollection = db.collection("bookings");
-    const paymentsCollection = db.collection("payments");
-    const plansCollection = db.collection("plans");
+    db = client.db(process.env.DB_NAME);
+    userCollection = db.collection("user");
+    organizationCollection = db.collection("organizations");
+    eventsCollection = db.collection("events");
+    bookingCollection = db.collection("bookings");
+    paymentsCollection = db.collection("payments");
+    plansCollection = db.collection("plans");
 
 
     await bookingCollection.createIndex(
@@ -1524,7 +1547,7 @@ app.get("/api/payments/organizer/:email", verifyToken, async (req, res) => {
 
 // ---------- ADMIN OVERVIEW STATS ----------
 
-app.get("/api/admin/stats", async (req, res) => {
+app.get("/api/admin/stats",verifyToken,verifyAdmin, async (req, res) => {
   try {
     const [
       totalUsers,
@@ -1607,7 +1630,7 @@ app.get("/api/admin/stats", async (req, res) => {
 // ADMIN USERS
 // ==========================================
 
-app.get("/api/admin/users", async (req, res) => {
+app.get("/api/admin/users",verifyToken,verifyAdmin, async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page) || 1, 1);
 
@@ -1694,7 +1717,7 @@ app.get("/api/admin/users", async (req, res) => {
   }
 });
 
-app.patch("/api/admin/users/:id/block", async (req, res) => {
+app.patch("/api/admin/users/:id/block",verifyToken,verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1735,7 +1758,7 @@ app.patch("/api/admin/users/:id/block", async (req, res) => {
   }
 });
 
-app.patch("/api/admin/users/:id/unblock", async (req, res) => {
+app.patch("/api/admin/users/:id/unblock",verifyToken,verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1780,7 +1803,7 @@ app.patch("/api/admin/users/:id/unblock", async (req, res) => {
 // ADMIN EVENTS
 // ==========================================
 
-app.get("/api/admin/events", async (req, res) => {
+app.get("/api/admin/events",verifyToken,verifyAdmin, async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page) || 1, 1);
 
@@ -1860,7 +1883,7 @@ app.get("/api/admin/events", async (req, res) => {
   }
 });
 
-app.patch("/api/admin/events/:id/approve", async (req, res) => {
+app.patch("/api/admin/events/:id/approve",verifyToken,verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1901,7 +1924,7 @@ app.patch("/api/admin/events/:id/approve", async (req, res) => {
   }
 });
 
-app.patch("/api/admin/events/:id/reject", async (req, res) => {
+app.patch("/api/admin/events/:id/reject",verifyToken,verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1942,7 +1965,7 @@ app.patch("/api/admin/events/:id/reject", async (req, res) => {
   }
 });
 
-app.delete("/api/admin/events/:id", async (req, res) => {
+app.delete("/api/admin/events/:id",verifyToken,verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1975,15 +1998,11 @@ app.delete("/api/admin/events/:id", async (req, res) => {
   }
 });
 
-// ==========================================
-// ADMIN TRANSACTIONS
-// ==========================================
-
 // ======================================================
 // ADMIN - ALL TRANSACTIONS
 // Organizer payments + attendee ticket bookings
 // ======================================================
-app.get("/api/admin/transactions", async (req, res) => {
+app.get("/api/admin/transactions",verifyToken,verifyAdmin, async (req, res) => {
   try {
     // ------------------------------------------
     // 1. Get organizer payments
@@ -2259,7 +2278,7 @@ app.get("/api/admin/transactions", async (req, res) => {
 // ======================================================
 // ADMIN - ANALYTICS
 // ======================================================
-app.get("/api/admin/analytics", async (req, res) => {
+app.get("/api/admin/analytics",verifyToken,verifyAdmin, async (req, res) => {
   try {
     // ====================================================
     // 1. BASIC COUNTS
@@ -2805,7 +2824,7 @@ app.get("/api/bookings/user/:email",verifyToken,
     
 
     // ---------- UPDATE USER PROFILE ----------
-app.patch("/api/users/profile", async (req, res) => {
+app.patch("/api/users/profile",verifyToken, async (req, res) => {
   try {
     const { email, name, image } = req.body;
 
