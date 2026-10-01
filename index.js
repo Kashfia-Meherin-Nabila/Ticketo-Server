@@ -78,7 +78,7 @@ const verifyAdmin = async (req, res, next) => {
   }
 };
 
-// async function run() {
+async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
     // await client.connect();
@@ -668,6 +668,41 @@ app.post("/api/payments/webhook", async (req, res) => {
   });
 });
 
+// browse events
+ app.get("/api/events", async (req, res) => {
+      try {
+        const page = Math.max(parseInt(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit) || 8, 1), 24);
+        const { search, category, location } = req.query;
+
+        const query = { ...PUBLIC_FILTER };
+        if (search?.trim()) {
+          query.title = { $regex: escapeRegex(search.trim()), $options: "i" };
+        }
+        if (category) query.category = category;
+        if (location) query.location = location;
+
+        const [events, total] = await Promise.all([
+          eventsCollection
+            .find(query)
+            .sort({ date: 1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .toArray(),
+          eventsCollection.countDocuments(query),
+        ]);
+
+        res.json({
+          events,
+          total,
+          page,
+          totalPages: Math.max(Math.ceil(total / limit), 1),
+        });
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Failed to fetch events" });
+      }
+    });
 
 
     // ==========================================
@@ -1354,40 +1389,7 @@ if (
     });
 
     // ---------- BROWSE (search + filter + pagination) ----------
-    app.get("/api/events", async (req, res) => {
-      try {
-        const page = Math.max(parseInt(req.query.page) || 1, 1);
-        const limit = Math.min(Math.max(parseInt(req.query.limit) || 8, 1), 24);
-        const { search, category, location } = req.query;
-
-        const query = { ...PUBLIC_FILTER };
-        if (search?.trim()) {
-          query.title = { $regex: escapeRegex(search.trim()), $options: "i" };
-        }
-        if (category) query.category = category;
-        if (location) query.location = location;
-
-        const [events, total] = await Promise.all([
-          eventsCollection
-            .find(query)
-            .sort({ date: 1 })
-            .skip((page - 1) * limit)
-            .limit(limit)
-            .toArray(),
-          eventsCollection.countDocuments(query),
-        ]);
-
-        res.json({
-          events,
-          total,
-          page,
-          totalPages: Math.max(Math.ceil(total / limit), 1),
-        });
-      } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: "Failed to fetch events" });
-      }
-    });
+   
 
     app.get("/api/events-filters", async (req, res) => {
       try {
@@ -2931,14 +2933,14 @@ app.patch("/api/users/profile",verifyToken, async (req, res) => {
 
 
 
-// }
+}
 run().catch(console.dir);
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
-// app.listen(port, () => {
-//   console.log(`Example app listening on port ${port}`);
-// });
-module.exports = app;
+app.listen(port, () => {
+  console.log(`Example app listening on port ${port}`);
+});
+// module.exports = app;
