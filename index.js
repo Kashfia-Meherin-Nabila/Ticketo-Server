@@ -674,6 +674,138 @@ app.post("/api/payments/webhook", async (req, res) => {
       }
     }
 
+if (paymentType === "subscription") {
+  try {
+    if (session.payment_status !== "paid") {
+      return res.json({
+        received: true,
+        planUpdated: false,
+        message: "Payment not completed yet",
+      });
+    }
+
+    const planId = session.metadata?.planId;
+
+    const organizerEmail = String(
+      session.metadata?.organizerEmail ||
+        session.customer_details?.email ||
+        session.customer_email ||
+        ""
+    )
+      .trim()
+      .toLowerCase();
+
+    if (!planId || !organizerEmail) {
+      console.error("❌ Missing subscription metadata", {
+        sessionId: session.id,
+        planId,
+        organizerEmail,
+      });
+
+      return res.json({
+        received: true,
+        planUpdated: false,
+        message: "Missing subscription metadata",
+      });
+    }
+
+    // Idempotency: Stripe retries webhooks
+    const alreadyProcessed = await paymentsCollection.findOne({
+      stripeSessionId: session.id,
+    });
+
+    if (alreadyProcessed) {
+      return res.json({
+        received: true,
+        planUpdated: false,
+        alreadyExists: true,
+        message: "Subscription already processed",
+      });
+    }
+
+    // Always read limits from YOUR plans collection, never from metadata
+    const plan = await plansCollection.findOne({ planId, active: true });
+
+    if (!plan) {
+      console.error("❌ Plan not found:", planId);
+      return res.json({
+        received: true,
+        planUpdated: false,
+        message: "Plan not found",
+      });
+    }
+
+    const stripeCustomerId =
+      typeof session.customer === "string"
+        ? session.customer
+        : session.customer?.id || null;
+
+    const stripeSubscriptionId =
+      typeof session.subscription === "string"
+        ? session.subscription
+        : session.subscription?.id || null;
+
+    // 1. Update the organization (this is what the event limit reads)
+    const orgResult = await organizationCollection.updateOne(
+      { organizerEmail },
+      {
+        $set: {
+          planId: plan.planId,
+          planName: plan.name,
+          maxEvents: plan.maxEvents,
+          unlimitedEvents: Boolean(plan.unlimitedEvents),
+          planStatus: "active",
+          stripeCustomerId,
+          stripeSubscriptionId,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    // 2. Update the user document (what POST /api/events also checks)
+    await userCollection.updateOne(
+      { email: organizerEmail },
+      { $set: { plan: plan.planId, updatedAt: new Date() } }
+    );
+
+    // 3. Record the payment (admin transactions page reads this)
+    await paymentsCollection.insertOne({
+      organizerEmail,
+      paymentType: "subscription",
+      planId: plan.planId,
+      planName: plan.name,
+      billingPeriod: plan.billingPeriod || "monthly",
+      amount: Number(session.amount_total || 0) / 100,
+      currency: session.currency || "usd",
+      paymentStatus: "paid",
+      stripeSessionId: session.id,
+      stripeCustomerId,
+      stripeSubscriptionId,
+      createdAt: new Date(),
+    });
+
+    console.log(
+      `✅ Plan "${plan.planId}" activated for ${organizerEmail} (org matched: ${orgResult.matchedCount})`
+    );
+
+    return res.status(200).json({
+      received: true,
+      planUpdated: true,
+      message: "Plan activated",
+    });
+  } catch (error) {
+    console.error("❌ Subscription webhook error:", error);
+
+    // 500 makes Stripe retry, which is what you want for a transient DB error
+    return res.status(500).json({
+      received: true,
+      planUpdated: false,
+      message: "Subscription processing failed",
+    });
+  }
+}
+
+
     // ========================================================
     // OTHER STRIPE PAYMENT TYPES
     // ========================================================
