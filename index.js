@@ -762,143 +762,121 @@ app.post("/api/payments/webhook", async (req, res) => {
 // ==========================================
 
 app.get(
-  "/api/organizer/overview/:email", verifyToken,
+  "/api/organizer/overview/:email",
+  verifyToken,
+  requireSelfEmail,
   async (req, res) => {
     try {
-      const email = decodeURIComponent(
-        req.params.email
-      ).toLowerCase();
+      const email = decodeURIComponent(req.params.email)
+        .trim()
+        .toLowerCase();
 
-      // ==========================================
+      // ------------------------------------------
       // ORGANIZATION
-      // ==========================================
+      // ------------------------------------------
+      const organization = await organizationCollection.findOne({
+        organizerEmail: email,
+      });
 
-      const organization =
-        await organizationCollection.findOne({
-          organizerEmail: email,
+      // ------------------------------------------
+      // NEW ORGANIZER: no organization yet (normal state, not an error)
+      // ------------------------------------------
+      if (!organization) {
+        const freePlan = await plansCollection.findOne({
+          planId: "free",
+          active: true,
         });
 
-      if (!organization) {
-        return res.status(404).json({
-          success: false,
-          message: "Organization not found",
+        const freeMax = freePlan?.maxEvents ?? 3;
+        const freeUnlimited = freePlan?.unlimitedEvents ?? false;
+
+        return res.status(200).json({
+          success: true,
+          hasOrganization: false,
+          organization: null,
+
+          plan: {
+            planId: "free",
+            planName: freePlan?.name || "Free",
+            maxEvents: freeMax,
+            unlimitedEvents: freeUnlimited,
+            planStatus: "active",
+            price: freePlan?.price || 0,
+            currency: freePlan?.currency || "USD",
+            billingPeriod: freePlan?.billingPeriod || "monthly",
+          },
+
+          usage: {
+            totalEvents: 0,
+            eventsRemaining: freeUnlimited ? null : freeMax,
+            usagePercentage: 0,
+          },
+
+          stats: {
+            totalEvents: 0,
+            totalAttendees: 0,
+            totalRevenue: 0,
+            totalSoldTickets: 0,
+          },
         });
       }
 
-      // ==========================================
-      // EVENTS
-      // ==========================================
+      const organizationId = String(organization._id);
 
-      const totalEvents =
-        await eventsCollection.countDocuments({
-          organizationId: String(organization._id),
-        });
+      // ------------------------------------------
+      // EVENTS (ids are reused for the bookings query)
+      // ------------------------------------------
+      const orgEvents = await eventsCollection
+        .find({ organizationId }, { projection: { _id: 1 } })
+        .toArray();
 
-      // ==========================================
-      // BOOKINGS
-      // ==========================================
+      const totalEvents = orgEvents.length;
+      const eventIds = orgEvents.map((e) => e._id.toString());
 
-      const bookingStats =
-        await bookingCollection
-          .aggregate([
-            {
-              $match: {
-                eventId: {
-                  $exists: true,
-                },
-              },
-            },
-
-            {
-              $lookup: {
-                from: "events",
-                let: {
-                  bookingEventId: "$eventId",
-                },
-                pipeline: [
-                  {
-                    $match: {
-                      $expr: {
-                        $or: [
-                          {
-                            $eq: [
-                              {
-                                $toString: "$_id",
-                              },
-                              "$$bookingEventId",
-                            ],
-                          },
-                          {
-                            $eq: [
-                              "$_id",
-                              "$$bookingEventId",
-                            ],
-                          },
-                        ],
-                      },
-                    },
-                  },
-                ],
-                as: "event",
-              },
-            },
-
-            {
-              $unwind: {
-                path: "$event",
-                preserveNullAndEmptyArrays: false,
-              },
-            },
-
-            {
-              $match: {
-                "event.organizationId":
-                  String(organization._id),
-              },
-            },
-
-            {
-              $group: {
-                _id: null,
-
-                totalAttendees: {
-                  $sum: {
-                    $ifNull: ["$quantity", 0],
-                  },
-                },
-
-                totalRevenue: {
-                  $sum: {
-                    $ifNull: ["$amount", 0],
-                  },
-                },
-
-                totalSoldTickets: {
-                  $sum: {
-                    $ifNull: ["$quantity", 0],
-                  },
-                },
-              },
-            },
-          ])
-          .toArray();
-
-      const stats = bookingStats[0] || {
+      // ------------------------------------------
+      // BOOKINGS (bookings store eventId as a string)
+      // ------------------------------------------
+      let stats = {
         totalAttendees: 0,
         totalRevenue: 0,
         totalSoldTickets: 0,
       };
 
-      // ==========================================
-      // PLAN
-      // ==========================================
+      if (eventIds.length > 0) {
+        const bookingStats = await bookingCollection
+          .aggregate([
+            { $match: { eventId: { $in: eventIds } } },
+            {
+              $group: {
+                _id: null,
+                totalAttendees: { $sum: { $ifNull: ["$quantity", 0] } },
+                totalRevenue: {
+                  $sum: {
+                    $convert: {
+                      input: "$amount",
+                      to: "double",
+                      onError: 0,
+                      onNull: 0,
+                    },
+                  },
+                },
+                totalSoldTickets: { $sum: { $ifNull: ["$quantity", 0] } },
+              },
+            },
+          ])
+          .toArray();
 
+        if (bookingStats[0]) stats = bookingStats[0];
+      }
+
+      // ------------------------------------------
+      // PLAN
+      // ------------------------------------------
       let plan = await plansCollection.findOne({
         planId: organization.planId || "free",
         active: true,
       });
 
-      // Safety fallback
       if (!plan) {
         plan = await plansCollection.findOne({
           planId: "free",
@@ -906,92 +884,63 @@ app.get(
         });
       }
 
-      const maxEvents =
-        organization.maxEvents ??
-        plan?.maxEvents ??
-        3;
+      const maxEvents = organization.maxEvents ?? plan?.maxEvents ?? 3;
 
       const unlimitedEvents =
-        organization.unlimitedEvents ??
-        plan?.unlimitedEvents ??
-        false;
+        organization.unlimitedEvents ?? plan?.unlimitedEvents ?? false;
 
       const eventsRemaining = unlimitedEvents
         ? null
         : Math.max(maxEvents - totalEvents, 0);
 
+      const usagePercentage =
+        unlimitedEvents || maxEvents <= 0
+          ? 0
+          : Math.min(Math.round((totalEvents / maxEvents) * 100), 100);
+
+      // ------------------------------------------
+      // RESPONSE
+      // ------------------------------------------
       return res.status(200).json({
         success: true,
+        hasOrganization: true,
 
         organization: {
           _id: organization._id,
-          organizationName:
-            organization.organizationName,
-          organizerEmail:
-            organization.organizerEmail,
+          organizationName: organization.organizationName,
+          organizerEmail: organization.organizerEmail,
         },
 
         plan: {
           planId: organization.planId || "free",
-          planName:
-            organization.planName ||
-            plan?.name ||
-            "Free",
-
+          planName: organization.planName || plan?.name || "Free",
           maxEvents,
-
           unlimitedEvents,
-
-          planStatus:
-            organization.planStatus || "active",
-
+          planStatus: organization.planStatus || "active",
           price: plan?.price || 0,
-
-          currency:
-            plan?.currency || "USD",
-
-          billingPeriod:
-            plan?.billingPeriod || "monthly",
+          currency: plan?.currency || "USD",
+          billingPeriod: plan?.billingPeriod || "monthly",
         },
 
         usage: {
           totalEvents,
-
           eventsRemaining,
-
-          usagePercentage: unlimitedEvents
-            ? 0
-            : Math.min(
-                Math.round(
-                  (totalEvents / maxEvents) * 100
-                ),
-                100
-              ),
+          usagePercentage,
         },
 
         stats: {
           totalEvents,
-
-          totalAttendees:
-            stats.totalAttendees || 0,
-
-          totalRevenue:
-            stats.totalRevenue || 0,
-
-          totalSoldTickets:
-            stats.totalSoldTickets || 0,
+          totalAttendees: stats.totalAttendees || 0,
+          totalRevenue: stats.totalRevenue || 0,
+          totalSoldTickets: stats.totalSoldTickets || 0,
         },
       });
     } catch (error) {
-      console.error(
-        "Organizer overview error:",
-        error
-      );
+      console.error("Organizer overview error:", error);
 
       return res.status(500).json({
         success: false,
-        message:
-          "Failed to load organizer overview",
+        message: "Failed to load organizer overview",
       });
     }
   }
