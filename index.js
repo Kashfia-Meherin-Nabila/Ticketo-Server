@@ -746,21 +746,26 @@ if (paymentType === "subscription") {
         : session.subscription?.id || null;
 
     // 1. Update the organization (this is what the event limit reads)
-    const orgResult = await organizationCollection.updateOne(
-      { organizerEmail },
-      {
-        $set: {
-          planId: plan.planId,
-          planName: plan.name,
-          maxEvents: plan.maxEvents,
-          unlimitedEvents: Boolean(plan.unlimitedEvents),
-          planStatus: "active",
-          stripeCustomerId,
-          stripeSubscriptionId,
-          updatedAt: new Date(),
-        },
-      }
-    );
+   // 1. Update the organization: ADD the new plan's events to the current limit
+const currentOrg = await organizationCollection.findOne({ organizerEmail });
+
+const currentMax = Number(currentOrg?.maxEvents ?? 0);
+
+const orgResult = await organizationCollection.updateOne(
+  { organizerEmail },
+  {
+    $set: {
+      planId: plan.planId,
+      planName: plan.name,
+      maxEvents: currentMax + Number(plan.maxEvents),
+      unlimitedEvents: Boolean(plan.unlimitedEvents || currentOrg?.unlimitedEvents),
+      planStatus: "active",
+      stripeCustomerId,
+      stripeSubscriptionId,
+      updatedAt: new Date(),
+    },
+  }
+);
 
     // 2. Update the user document (what POST /api/events also checks)
     await userCollection.updateOne(
@@ -1098,27 +1103,24 @@ app.get(
     });
 
     // Post Organization in DB
-   app.post("/api/organization", verifyToken, async (req, res) => {
+  // Replace the whole POST /api/organization route with this.
+app.post("/api/organization", verifyToken, async (req, res) => {
   try {
-    const {
-      organizationName,
-      logo,
-      website,
-      description,
-      organizerEmail,
-    } = req.body;
+    const { organizationName, logo, website, description } = req.body;
 
-    if (!organizationName || !organizerEmail) {
+    // Use the email from the verified token, not from the request body
+    const organizerEmail = String(req.user.email).trim().toLowerCase();
+
+    if (!organizationName || !organizationName.trim()) {
       return res.status(400).json({
-        message: "Organization name and organizer email are required",
+        message: "Organization name is required",
       });
     }
 
     // Check existing organization
-    const existingOrganization =
-      await organizationCollection.findOne({
-        organizerEmail,
-      });
+    const existingOrganization = await organizationCollection.findOne({
+      organizerEmail,
+    });
 
     if (existingOrganization) {
       return res.status(409).json({
@@ -1127,7 +1129,7 @@ app.get(
       });
     }
 
-    // Get Free plan
+    // Base plan
     const freePlan = await plansCollection.findOne({
       planId: "free",
       active: true,
@@ -1139,25 +1141,52 @@ app.get(
       });
     }
 
+    // ------------------------------------------------------------
+    // Plans this organizer bought BEFORE creating the organization.
+    // Limits are additive: Free (3) + every purchased plan.
+    // ------------------------------------------------------------
+    const purchases = await paymentsCollection
+      .find({
+        organizerEmail,
+        paymentType: "subscription",
+        paymentStatus: "paid",
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    let currentPlan = freePlan; // the most recent purchase, or Free
+    let maxEvents = Number(freePlan.maxEvents) || 0;
+    let unlimitedEvents = Boolean(freePlan.unlimitedEvents);
+
+    for (let i = 0; i < purchases.length; i++) {
+      const purchasedPlan = await plansCollection.findOne({
+        planId: purchases[i].planId,
+      });
+
+      if (!purchasedPlan) continue;
+
+      if (i === 0) currentPlan = purchasedPlan;
+
+      maxEvents += Number(purchasedPlan.maxEvents) || 0;
+      if (purchasedPlan.unlimitedEvents) unlimitedEvents = true;
+    }
+
     const addData = {
-      organizationName,
+      organizationName: organizationName.trim(),
       logo,
       website,
       description,
       organizerEmail,
 
-      // ==============================
-      // DEFAULT FREE PLAN
-      // ==============================
-      planId: freePlan.planId,
-      planName: freePlan.name,
-      maxEvents: freePlan.maxEvents,
-      unlimitedEvents: freePlan.unlimitedEvents,
+      planId: currentPlan.planId,
+      planName: currentPlan.name,
+      maxEvents,
+      unlimitedEvents,
       planStatus: "active",
 
-      // Stripe
-      stripeCustomerId: null,
-      stripeSubscriptionId: null,
+      // Stripe (carried over if a plan was bought first)
+      stripeCustomerId: purchases[0]?.stripeCustomerId || null,
+      stripeSubscriptionId: purchases[0]?.stripeSubscriptionId || null,
       subscriptionCurrentPeriodEnd: null,
 
       status: "active",
@@ -1166,8 +1195,7 @@ app.get(
       updatedAt: new Date(),
     };
 
-    const result =
-      await organizationCollection.insertOne(addData);
+    const result = await organizationCollection.insertOne(addData);
 
     return res.status(201).json({
       ...result,
